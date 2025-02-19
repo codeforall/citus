@@ -384,8 +384,12 @@ TransferShards(int64 shardId, char *sourceNodeName,
 	}
 
 	ErrorIfTargetNodeIsNotSafeForTransfer(targetNodeName, targetNodePort, transferType);
-
-	AcquirePlacementColocationLock(distributedTableId, ExclusiveLock, operationName);
+	/* Create distributed table acquires SHARE placement lock on colocation, and here while
+	* rebalancing we acquire RowExclusiveLock, so we make create distributed table and
+	* rebalancing exclusive while we do not block concurrent move shard operations for
+	* a colocation group
+	*/
+	AcquirePlacementColocationLock(distributedTableId, RowExclusiveLock, operationName);
 
 	List *colocatedTableList = ColocatedTableList(distributedTableId);
 	List *colocatedShardList = ColocatedShardIntervalList(shardInterval);
@@ -677,7 +681,9 @@ IsShardListOnNode(List *colocatedShardList, char *targetNodeName, uint32 targetN
 
 /*
  * LockColocatedRelationsForMove takes a list of relations, locks all of them
- * using ShareUpdateExclusiveLock
+ * using RowExclusiveLock.
+ * use RowExclusiveLock instead of ShareUpdateExclusiveLock to allow parallel
+ * moves of the shards in same colocation group.
  */
 static void
 LockColocatedRelationsForMove(List *colocatedTableList)
@@ -685,7 +691,7 @@ LockColocatedRelationsForMove(List *colocatedTableList)
 	Oid colocatedTableId = InvalidOid;
 	foreach_declared_oid(colocatedTableId, colocatedTableList)
 	{
-		LockRelationOid(colocatedTableId, ShareUpdateExclusiveLock);
+		LockRelationOid(colocatedTableId, RowExclusiveLock);
 	}
 }
 

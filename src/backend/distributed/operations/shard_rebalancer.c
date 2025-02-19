@@ -2229,6 +2229,13 @@ RebalanceTableShardsBackground(RebalanceOptions *options, Oid shardReplicationMo
 			dependsArray = palloc(nDepends * sizeof(int64));
 			dependsArray[0] = replicateRefTablesTaskId;
 		}
+		else
+		{
+			/* TODO just short circuit it for now */
+			ereport(DEBUG2, (errmsg("Ignoring %d dependencies for move of shard %ld",nDepends,
+									move->shardId)));
+			nDepends = 0;
+		}
 
 		int32 nodesInvolved[2] = { 0 };
 		nodesInvolved[0] = move->sourceNode->nodeId;

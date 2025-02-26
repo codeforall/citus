@@ -123,7 +123,7 @@ RecoverTwoPhaseCommits(void)
 	/* take advisory lock first to avoid running concurrently */
 	LockTransactionRecovery(ShareUpdateExclusiveLock);
 
-	List *workerList = ActivePrimaryNodeList(NoLock);
+	List *workerList = ActivePrimaryRemoteNodeList(NoLock);
 	List *workerConnections = NIL;
 	WorkerNode *workerNode = NULL;
 	MultiConnection *connection = NULL;

@@ -305,6 +305,7 @@ citus_copy_one_shard_placement(PG_FUNCTION_ARGS)
 	PG_RETURN_VOID();
 }
 
+
 /*
  * citus_move_shard_placement moves given shard (and its co-located shards) from one
  * node to the other node. To accomplish this it entirely recreates the table structure
@@ -378,6 +379,8 @@ citus_move_shard_placement_with_nodeid(PG_FUNCTION_ARGS)
 
 	PG_RETURN_VOID();
 }
+
+
 /*
  * TransferShards is the function for shard transfers.
  */
@@ -464,9 +467,11 @@ TransferShards(int64 shardId, char *sourceNodeName,
 	}
 
 	bool transferAlreadyCompleted = TransferAlreadyCompleted(colocatedShardList,
-														sourceNodeName, sourceNodePort,
-														targetNodeName, targetNodePort,
-														transferType);
+															 sourceNodeName,
+															 sourceNodePort,
+															 targetNodeName,
+															 targetNodePort,
+															 transferType);
 
 	/*
 	 * If we just need to create the shard relationships,We don't need to do anything
@@ -482,15 +487,18 @@ TransferShards(int64 shardId, char *sourceNodeName,
 			 * the relationships, we can return right away
 			 */
 			ereport(WARNING, (errmsg("shard is not present on node %s:%d",
-									targetNodeName, targetNodePort),
-							errdetail("%s may have not completed.",
+									 targetNodeName, targetNodePort),
+							  errdetail("%s may have not completed.",
 										operationNameCapitalized)));
 			return;
 		}
 
-		CopyShardTables(colocatedShardList, sourceNodeName, sourceNodePort, targetNodeName,
-						targetNodePort, (shardReplicationMode == TRANSFER_MODE_FORCE_LOGICAL),
+		CopyShardTables(colocatedShardList, sourceNodeName, sourceNodePort, targetNodeName
+						,
+						targetNodePort, (shardReplicationMode ==
+										 TRANSFER_MODE_FORCE_LOGICAL),
 						operationFunctionName, optionFlags);
+
 		/* We don't need to do anything else, just return */
 		return;
 	}
@@ -499,8 +507,8 @@ TransferShards(int64 shardId, char *sourceNodeName,
 	{
 		/* if the transfer is already completed, we can return right away */
 		ereport(WARNING, (errmsg("shard is already present on node %s:%d",
-								targetNodeName, targetNodePort),
-						errdetail("%s may have already completed.",
+								 targetNodeName, targetNodePort),
+						  errdetail("%s may have already completed.",
 									operationNameCapitalized)));
 		return;
 	}
@@ -591,7 +599,8 @@ TransferShards(int64 shardId, char *sourceNodeName,
 	}
 
 	CopyShardTables(colocatedShardList, sourceNodeName, sourceNodePort, targetNodeName,
-					targetNodePort, useLogicalReplication, operationFunctionName, optionFlags);
+					targetNodePort, useLogicalReplication, operationFunctionName,
+					optionFlags);
 
 	if (transferType == SHARD_TRANSFER_MOVE)
 	{
@@ -648,6 +657,7 @@ TransferShards(int64 shardId, char *sourceNodeName,
 
 	FinalizeCurrentProgressMonitor();
 }
+
 
 /*
  * Insert deferred cleanup records.
@@ -1534,28 +1544,30 @@ CopyShardTablesViaBlockWrites(List *shardIntervalList, char *sourceNodeName,
 		foreach_declared_ptr(shardInterval, shardIntervalList)
 		{
 			/*
-			* For each shard we first create the shard table in a separate
-			* transaction and then we copy the data and create the indexes in a
-			* second separate transaction. The reason we don't do both in a single
-			* transaction is so we can see the size of the new shard growing
-			* during the copy when we run get_rebalance_progress in another
-			* session. If we wouldn't split these two phases up, then the table
-			* wouldn't be visible in the session that get_rebalance_progress uses.
-			* So get_rebalance_progress would always report its size as 0.
-			*/
-			List *ddlCommandList = RecreateShardDDLCommandList(shardInterval, sourceNodeName,
-															sourceNodePort);
+			 * For each shard we first create the shard table in a separate
+			 * transaction and then we copy the data and create the indexes in a
+			 * second separate transaction. The reason we don't do both in a single
+			 * transaction is so we can see the size of the new shard growing
+			 * during the copy when we run get_rebalance_progress in another
+			 * session. If we wouldn't split these two phases up, then the table
+			 * wouldn't be visible in the session that get_rebalance_progress uses.
+			 * So get_rebalance_progress would always report its size as 0.
+			 */
+			List *ddlCommandList = RecreateShardDDLCommandList(shardInterval,
+															   sourceNodeName,
+															   sourceNodePort);
 			char *tableOwner = TableOwner(shardInterval->relationId);
 
 			/* drop the shard we created on the target, in case of failure */
 			InsertCleanupRecordOutsideTransaction(CLEANUP_OBJECT_SHARD_PLACEMENT,
-												ConstructQualifiedShardName(shardInterval),
-												GroupForNode(targetNodeName,
-															targetNodePort),
-												CLEANUP_ON_FAILURE);
+												  ConstructQualifiedShardName(
+													  shardInterval),
+												  GroupForNode(targetNodeName,
+															   targetNodePort),
+												  CLEANUP_ON_FAILURE);
 
 			SendCommandListToWorkerOutsideTransaction(targetNodeName, targetNodePort,
-													tableOwner, ddlCommandList);
+													  tableOwner, ddlCommandList);
 		}
 
 		UpdatePlacementUpdateStatusForShardIntervalList(
@@ -1578,10 +1590,10 @@ CopyShardTablesViaBlockWrites(List *shardIntervalList, char *sourceNodeName,
 		{
 			List *ddlCommandList =
 				PostLoadShardCreationCommandList(shardInterval, sourceNodeName,
-												sourceNodePort);
+												 sourceNodePort);
 			char *tableOwner = TableOwner(shardInterval->relationId);
 			SendCommandListToWorkerOutsideTransaction(targetNodeName, targetNodePort,
-													tableOwner, ddlCommandList);
+													  tableOwner, ddlCommandList);
 
 			MemoryContextReset(localContext);
 		}
@@ -1594,9 +1606,9 @@ CopyShardTablesViaBlockWrites(List *shardIntervalList, char *sourceNodeName,
 	if (!(optionFlags & SHARD_TRANSFER_NO_CREATE_RELATIONSHIPS))
 	{
 		/*
-		* Once all shards are copied, we can recreate relationships between shards.
-		* Create DDL commands to Attach child tables to their parents in a partitioning hierarchy.
-		*/
+		 * Once all shards are copied, we can recreate relationships between shards.
+		 * Create DDL commands to Attach child tables to their parents in a partitioning hierarchy.
+		 */
 		List *shardIntervalWithDDCommandsList = NIL;
 		foreach_declared_ptr(shardInterval, shardIntervalList)
 		{
@@ -1609,7 +1621,7 @@ CopyShardTablesViaBlockWrites(List *shardIntervalList, char *sourceNodeName,
 					shardInterval,
 					list_make1(attachPartitionCommand));
 				shardIntervalWithDDCommandsList = lappend(shardIntervalWithDDCommandsList,
-														shardCommandList);
+														  shardCommandList);
 			}
 		}
 
@@ -1620,24 +1632,26 @@ CopyShardTablesViaBlockWrites(List *shardIntervalList, char *sourceNodeName,
 			PLACEMENT_UPDATE_STATUS_CREATING_FOREIGN_KEYS);
 
 		/*
-		* Iterate through the colocated shards and create DDL commamnds
-		* to create the foreign constraints.
-		*/
+		 * Iterate through the colocated shards and create DDL commamnds
+		 * to create the foreign constraints.
+		 */
 		foreach_declared_ptr(shardInterval, shardIntervalList)
 		{
 			List *shardForeignConstraintCommandList = NIL;
 			List *referenceTableForeignConstraintList = NIL;
 
 			CopyShardForeignConstraintCommandListGrouped(shardInterval,
-														&shardForeignConstraintCommandList,
-														&referenceTableForeignConstraintList);
+														 &
+														 shardForeignConstraintCommandList,
+														 &
+														 referenceTableForeignConstraintList);
 
 			ShardCommandList *shardCommandList = CreateShardCommandList(
 				shardInterval,
 				list_concat(shardForeignConstraintCommandList,
 							referenceTableForeignConstraintList));
 			shardIntervalWithDDCommandsList = lappend(shardIntervalWithDDCommandsList,
-													shardCommandList);
+													  shardCommandList);
 		}
 
 		/* Now execute the Partitioning & Foreign constraints creation commads. */
@@ -1646,8 +1660,8 @@ CopyShardTablesViaBlockWrites(List *shardIntervalList, char *sourceNodeName,
 		{
 			char *tableOwner = TableOwner(shardCommandList->shardInterval->relationId);
 			SendCommandListToWorkerOutsideTransaction(targetNodeName, targetNodePort,
-													tableOwner,
-													shardCommandList->ddlCommandList);
+													  tableOwner,
+													  shardCommandList->ddlCommandList);
 		}
 
 		UpdatePlacementUpdateStatusForShardIntervalList(
@@ -1736,7 +1750,8 @@ CopyShardsToNode(WorkerNode *sourceNode, WorkerNode *targetNode, List *shardInte
 
 	ExecuteTaskListOutsideTransaction(ROW_MODIFY_NONE, copyTaskList,
 									  MaxAdaptiveExecutorPoolSize,
-									  NULL /* jobIdList (ignored by API implementation) */);
+									  NULL /* jobIdList (ignored by API implementation) */
+									  );
 }
 
 

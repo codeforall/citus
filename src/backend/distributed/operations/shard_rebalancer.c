@@ -768,6 +768,7 @@ AcquireRebalanceColocationLock(Oid relationId, const char *operationName)
 	}
 }
 
+
 /*
  * AcquireRebalanceOperationLock does not allow concurrent rebalance
  * operations.
@@ -786,13 +787,14 @@ AcquireRebalanceOperationLock(const char *operationName)
 	if (!lockAcquired)
 	{
 		ereport(ERROR, (errmsg("could not acquire the lock required for %s operation",
-								operationName),
+							   operationName),
 						errdetail("It means that either a concurrent shard move "
-							"or shard copy is happening."),
+								  "or shard copy is happening."),
 						errhint("Make sure that the concurrent operation has "
 								"finished and re-run the command")));
 	}
 }
+
 
 /*
  * AcquirePlacementColocationLock tries to acquire a lock for
@@ -2033,13 +2035,14 @@ InitializeShardMoveDependencies()
  */
 static int64 *
 GenerateTaskMoveDependencyList(PlacementUpdateEvent *move, int64 *refTablesDepTaskIds,
-								int refTablesDepTaskIdsCount,
+							   int refTablesDepTaskIdsCount,
 							   ShardMoveDependencies shardMoveDependencies, int *nDepends)
 {
 	HTAB *dependsList = CreateSimpleHashSetWithNameAndSize(int64,
 														   "shardMoveDependencyList", 0);
 
 	bool found;
+
 	/*
 	 * Check if there exists moves scheduled earlier whose source node
 	 * overlaps with the current move's target node.
@@ -2104,7 +2107,6 @@ static void
 UpdateShardMoveDependencies(PlacementUpdateEvent *move, uint64 colocationId, int64 taskId,
 							ShardMoveDependencies shardMoveDependencies)
 {
-
 	bool found;
 	ShardMoveSourceNodeHashEntry *shardMoveSourceNodeHashEntry = hash_search(
 		shardMoveDependencies.nodeDependencies, &move->sourceNode->nodeId, HASH_ENTER,
@@ -2204,13 +2206,14 @@ RebalanceTableShardsBackground(RebalanceOptions *options, Oid shardReplicationMo
 
 	if (HasNodesWithMissingReferenceTables(&referenceTableIdList))
 	{
-		refTablesDepTaskIds = ScheduleTasksToParallelCopyReferenceTablesOnAllMissingNodes(jobId, TRANSFER_MODE_BLOCK_WRITES, &refTablesDepTaskIdsCount);
+		refTablesDepTaskIds = ScheduleTasksToParallelCopyReferenceTablesOnAllMissingNodes(
+			jobId, TRANSFER_MODE_BLOCK_WRITES, &refTablesDepTaskIdsCount);
 		ereport(DEBUG2,
-			(errmsg("%d dependent copy reference table tasks for job %ld",
-				refTablesDepTaskIdsCount, jobId),
-			 errdetail("Rebalance scheduled as background job"),
-			 errhint("To monitor progress, run: SELECT * FROM "
-					 "citus_rebalance_status();")));
+				(errmsg("%d dependent copy reference table tasks for job %ld",
+						refTablesDepTaskIdsCount, jobId),
+				 errdetail("Rebalance scheduled as background job"),
+				 errhint("To monitor progress, run: SELECT * FROM "
+						 "citus_rebalance_status();")));
 	}
 
 	PlacementUpdateEvent *move = NULL;

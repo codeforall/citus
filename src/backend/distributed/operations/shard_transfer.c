@@ -439,10 +439,9 @@ TransferShards(int64 shardId, char *sourceNodeName,
 	if (transferType == SHARD_TRANSFER_MOVE)
 	{
 		/*
-		 * Block concurrent DDL / TRUNCATE commands on the relation. Similarly,
-		 * block concurrent citus_move_shard_placement() on any shard of
-		 * the same relation. This is OK for now since we're executing shard
-		 * moves sequentially anyway.
+		 * Block concurrent DDL / TRUNCATE commands on the relation. while,
+		 * allow concurrent citus_move_shard_placement() on the shards of
+		 * the same relation.
 		 */
 		LockColocatedRelationsForMove(colocatedTableList);
 	}
@@ -752,7 +751,7 @@ IsShardListOnNode(List *colocatedShardList, char *targetNodeName, uint32 targetN
 
 /*
  * LockColocatedRelationsForMove takes a list of relations, locks all of them
- * using ShareUpdateExclusiveLock
+ * using ShareLock
  */
 static void
 LockColocatedRelationsForMove(List *colocatedTableList)
@@ -760,7 +759,7 @@ LockColocatedRelationsForMove(List *colocatedTableList)
 	Oid colocatedTableId = InvalidOid;
 	foreach_declared_oid(colocatedTableId, colocatedTableList)
 	{
-		LockRelationOid(colocatedTableId, ShareUpdateExclusiveLock);
+		LockRelationOid(colocatedTableId, ShareLock);
 	}
 }
 

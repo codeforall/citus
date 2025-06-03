@@ -168,6 +168,7 @@ PG_FUNCTION_INFO_V1(citus_coordinator_nodeid);
 PG_FUNCTION_INFO_V1(citus_is_coordinator);
 PG_FUNCTION_INFO_V1(citus_internal_mark_node_not_synced);
 PG_FUNCTION_INFO_V1(citus_is_primary_node);
+PG_FUNCTION_INFO_V1(citus_add_replica_node);
 
 /*
  * DefaultNodeMetadata creates a NodeMetadata struct with the fields set to
@@ -183,6 +184,8 @@ DefaultNodeMetadata()
 	nodeMetadata.nodeRack = WORKER_DEFAULT_RACK;
 	nodeMetadata.shouldHaveShards = true;
 	nodeMetadata.groupId = INVALID_GROUP_ID;
+	nodeMetadata.nodeisreplica = false;
+	nodeMetadata.nodeprimarynodeid = 0; /* 0 typically means InvalidNodeId */
 
 	return nodeMetadata;
 }
@@ -1419,6 +1422,141 @@ Datum
 master_update_node(PG_FUNCTION_ARGS)
 {
 	return citus_update_node(fcinfo);
+}
+
+
+/*
+ * citus_add_replica_node function adds a new node as a replica of an existing primary node.
+ * It records the replica's hostname, port, and links it to the primary node's ID.
+ * The replica is initially marked as inactive and not having shards.
+ */
+Datum
+citus_add_replica_node(PG_FUNCTION_ARGS)
+{
+	CheckCitusVersion(ERROR);
+	EnsureSuperUser();
+	EnsureCoordinator();
+
+	text *replicaHostnameText = PG_GETARG_TEXT_P(0);
+	int32 replicaPort = PG_GETARG_INT32(1);
+	text *primaryHostnameText = PG_GETARG_TEXT_P(2);
+	int32 primaryPort = PG_GETARG_INT32(3);
+
+	char *replicaHostname = text_to_cstring(replicaHostnameText);
+	char *primaryHostname = text_to_cstring(primaryHostnameText);
+
+	WorkerNode *primaryWorkerNode = FindWorkerNodeAnyCluster(primaryHostname, primaryPort);
+
+	if (primaryWorkerNode == NULL)
+	{
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						errmsg("primary node %s:%d not found in pg_dist_node",
+							   primaryHostname, primaryPort)));
+	}
+
+	/* Future-proofing: Ideally, a primary node should not itself be a replica.
+	 * This check might be more relevant once replica promotion logic exists.
+	 * For now, pg_dist_node.nodeisreplica defaults to false for existing nodes.
+	 */
+	if (primaryWorkerNode->nodeisreplica)
+	{
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						errmsg("primary node %s:%d is itself a replica and cannot have replicas",
+							   primaryHostname, primaryPort)));
+	}
+
+	WorkerNode *existingReplicaNode = FindWorkerNodeAnyCluster(replicaHostname, replicaPort);
+	if (existingReplicaNode != NULL)
+	{
+		/*
+		 * Idempotency check: If the node already exists, is it already correctly
+		 * registered as a replica for THIS primary?
+		 */
+		if (existingReplicaNode->nodeisreplica &&
+			existingReplicaNode->nodeprimarynodeid == primaryWorkerNode->nodeId)
+		{
+			ereport(NOTICE, (errmsg("node %s:%d is already registered as a replica for primary %s:%d (nodeid %d)",
+									replicaHostname, replicaPort,
+									primaryHostname, primaryPort, primaryWorkerNode->nodeId)));
+			PG_RETURN_INT32(existingReplicaNode->nodeId);
+		}
+		else
+		{
+			ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							errmsg("a different node %s:%d (nodeid %d) already exists or is a replica for a different primary",
+								   replicaHostname, replicaPort, existingReplicaNode->nodeId)));
+		}
+	}
+
+	NodeMetadata nodeMetadata = DefaultNodeMetadata();
+
+	nodeMetadata.nodeisreplica = true;
+	nodeMetadata.nodeprimarynodeid = primaryWorkerNode->nodeId;
+	nodeMetadata.isActive = false; /* Replicas start as inactive */
+	nodeMetadata.shouldHaveShards = false; /* Replicas do not directly own primary shards */
+	nodeMetadata.groupId = primaryWorkerNode->groupId; /* Same group as primary */
+	nodeMetadata.nodeRole = primaryWorkerNode->nodeRole; /* Inherits role from primary */
+	nodeMetadata.nodeCluster = primaryWorkerNode->nodeCluster; /* Same cluster as primary */
+	/* Other fields like hasMetadata, metadataSynced will take defaults from DefaultNodeMetadata
+	 * (typically true, true for hasMetadata and metadataSynced if it's a new node,
+	 * or might need adjustment based on replica strategy)
+	 * For now, let's assume DefaultNodeMetadata provides suitable defaults for these
+	 * or they will be set by AddNodeMetadata/ActivateNodeList if needed.
+	 * Specifically, hasMetadata is often true, and metadataSynced true after activation.
+	 * Since this replica is inactive, metadata sync status might be less critical initially.
+	 */
+
+	bool nodeAlreadyExists = false;
+	bool localOnly = false; /* Propagate change to other workers with metadata */
+
+	/*
+	 * AddNodeMetadata will take an ExclusiveLock on pg_dist_node.
+	 * It also checks again if the node already exists after acquiring the lock.
+	 */
+	int replicaNodeId = AddNodeMetadata(replicaHostname, replicaPort, &nodeMetadata,
+										&nodeAlreadyExists, localOnly);
+
+	if (nodeAlreadyExists)
+	{
+		/* This case should ideally be caught by the FindWorkerNodeAnyCluster check above,
+		 * but AddNodeMetadata does its own check after locking.
+		 * If it already exists and is correctly configured, we might have returned NOTICE above.
+		 * If it exists but is NOT correctly configured as our replica, an ERROR would be more appropriate.
+		 * AddNodeMetadata returns the existing node's ID if it finds one.
+		 * We need to ensure it is the *correct* replica.
+		 */
+		WorkerNode *fetchedExistingNode = FindNodeAnyClusterByNodeId(replicaNodeId);
+		if (fetchedExistingNode != NULL && fetchedExistingNode->nodeisreplica &&
+			fetchedExistingNode->nodeprimarynodeid == primaryWorkerNode->nodeId)
+		{
+			ereport(NOTICE, (errmsg("node %s:%d was already correctly registered as a replica for primary %s:%d (nodeid %d)",
+									replicaHostname, replicaPort,
+									primaryHostname, primaryPort, primaryWorkerNode->nodeId)));
+			/* Intentional fall-through to return replicaNodeId */
+		}
+		else
+		{
+			/* This state is less expected if our initial check passed or errored. */
+			ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+							errmsg("node %s:%d already exists but is not correctly configured as a replica for primary %s:%d",
+								   replicaHostname, replicaPort, primaryHostname, primaryPort)));
+		}
+	}
+
+	TransactionModifiedNodeMetadata = true;
+
+	/*
+	 * Note: Replicas added this way are inactive.
+	 * A separate mechanism or UDF (e.g., citus_activate_replica_node or citus_promote_replica_node)
+	 * would be needed to activate them, potentially after verifying replication lag, etc.
+	 * Activation would typically involve:
+	 * 1. Setting isActive = true.
+	 * 2. Ensuring metadata is synced (hasMetadata=true, metadataSynced=true).
+	 * 3. Potentially other logic like adding to specific scheduler lists.
+	 * For now, citus_add_node_replica just registers it.
+	 */
+
+	PG_RETURN_INT32(replicaNodeId);
 }
 
 
@@ -2924,6 +3062,16 @@ InsertNodeRow(int nodeid, char *nodeName, int32 nodePort, NodeMetadata *nodeMeta
 	values[Anum_pg_dist_node_nodecluster - 1] = nodeClusterNameDatum;
 	values[Anum_pg_dist_node_shouldhaveshards - 1] = BoolGetDatum(
 		nodeMetadata->shouldHaveShards);
+	values[Anum_pg_dist_node_nodeisreplica - 1] = BoolGetDatum(
+		nodeMetadata->nodeisreplica);
+	values[Anum_pg_dist_node_nodeprimarynodeid - 1] = Int32GetDatum(
+		nodeMetadata->nodeprimarynodeid);
+
+	/* nodeprimarynodeid can be NULL (0 in our case if it's an invalid/non-existent primary) */
+	if (nodeMetadata->nodeprimarynodeid == 0)
+	{
+		isNulls[Anum_pg_dist_node_nodeprimarynodeid - 1] = true;
+	}
 
 	Relation pgDistNode = table_open(DistNodeRelationId(), RowExclusiveLock);
 
@@ -3014,8 +3162,7 @@ TupleToWorkerNode(TupleDesc tupleDescriptor, HeapTuple heapTuple)
 
 	/*
 	 * This function can be called before "ALTER TABLE ... ADD COLUMN nodecluster ...",
-	 * therefore heap_deform_tuple() won't set the isNullArray for this column. We
-	 * initialize it true to be safe in that case.
+	 * and other columns. We initialize isNullArray to true to be safe.
 	 */
 	memset(isNullArray, true, sizeof(isNullArray));
 
@@ -3042,6 +3189,25 @@ TupleToWorkerNode(TupleDesc tupleDescriptor, HeapTuple heapTuple)
 	workerNode->shouldHaveShards = DatumGetBool(
 		datumArray[Anum_pg_dist_node_shouldhaveshards -
 				   1]);
+
+	/* nodeisreplica and nodeprimarynodeid might be null if row is from older version */
+	if (!isNullArray[Anum_pg_dist_node_nodeisreplica - 1])
+	{
+		workerNode->nodeisreplica = DatumGetBool(datumArray[Anum_pg_dist_node_nodeisreplica - 1]);
+	}
+	else
+	{
+		workerNode->nodeisreplica = false; /* Default value */
+	}
+
+	if (!isNullArray[Anum_pg_dist_node_nodeprimarynodeid - 1])
+	{
+		workerNode->nodeprimarynodeid = DatumGetInt32(datumArray[Anum_pg_dist_node_nodeprimarynodeid - 1]);
+	}
+	else
+	{
+		workerNode->nodeprimarynodeid = 0; /* Default value for InvalidNodeId */
+	}
 
 	/*
 	 * nodecluster column can be missing. In the case of extension creation/upgrade,

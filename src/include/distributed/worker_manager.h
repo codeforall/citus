@@ -54,6 +54,8 @@ typedef struct WorkerNode
 	char nodeCluster[NAMEDATALEN];      /* the cluster the node is a part of */
 	bool metadataSynced;                /* node has the most recent metadata */
 	bool shouldHaveShards;              /* if the node should have distributed table shards on it or not */
+	bool nodeisreplica;                 /* whether this node is a replica */
+	int32 nodeprimarynodeid;            /* nodeid of the primary for this replica */
 } WorkerNode;
 
 

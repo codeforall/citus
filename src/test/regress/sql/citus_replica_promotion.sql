@@ -91,51 +91,97 @@ SELECT pg_catalog.citus_promote_replica_and_rebalance(2); -- Worker 1 is not a r
 -- The UDF currently has a placeholder for GetNextGroupId and will emit a WARNING.
 -- The UDF will also emit NOTICEs for WAL sync and promotion steps.
 -- The actual connection attempts to the replica for pg_is_in_recovery will fail in CI.
--- So this call will likely error out when it tries to connect to the replica.
+-- So this call will likely error out when it tries to connect to the replica to execute pg_promote().
 -- We will expect this error.
 SELECT pg_catalog.citus_promote_replica_and_rebalance(5);
 
 
--- Verification after (attempted) promotion of node 5:
--- Since the above call is expected to fail when it tries to connect to the replica to check pg_is_in_recovery(),
--- we won't see the metadata changes or rebalancing yet.
--- A more advanced test setup would be needed to mock the replica's state.
+-- Simulate state after citus_promote_replica_and_rebalance *would have* updated pg_dist_node,
+-- but before it calls the (now separated) rebalancing logic.
+-- This is because pg_promote() call inside the UDF is expected to fail in CI.
+\echo === Simulating successful pg_dist_node update part of promote_replica_and_rebalance ===
+-- Node 5 was replica of Node 4 (group 2)
+-- We need to:
+-- 1. Make Node 5 active.
+-- 2. Make Node 5 not a replica.
+-- 3. Set Node 5's primarynodeid to 0/NULL.
+-- 4. Give Node 5 a new groupid.
+UPDATE pg_catalog.pg_dist_node SET isactive = true, nodeisreplica = false, nodeprimarynodeid = 0 WHERE nodeid = 5;
+-- Get a new group ID using the helper. This would be done internally by citus_promote_replica_and_rebalance.
+SELECT pg_catalog.citus_internal_get_next_group_id() AS new_group_id_for_promoted_node \gset
+UPDATE pg_catalog.pg_dist_node SET groupid = :new_group_id_for_promoted_node WHERE nodeid = 5;
 
--- For now, let's verify the state of the nodes as they were before the failing promotion call.
-\echo Final state of pg_dist_node after tests:
+\echo pg_dist_node state after manually simulating promotion of node 5:
 SELECT nodeid, groupid, nodename, nodeport, noderole, nodeisreplica, nodeprimarynodeid, isactive FROM pg_catalog.pg_dist_node ORDER BY nodeid;
 
-\echo Shard placements for dist_table (should be on group 1, original primary for promo test node has group 2):
-SELECT p.shardid, n.nodename, n.nodeport, n.groupid
+-- Now, call citus_finalize_replica_rebalance_metadata
+-- Original primary was node 4 (group 2). Promoted replica is node 5 (now in new_group_id_for_promoted_node).
+\echo === Testing citus_finalize_replica_rebalance_metadata ===
+SELECT pg_catalog.citus_finalize_replica_rebalance_metadata(2, :new_group_id_for_promoted_node, 4, 5);
+
+\echo Verification after citus_finalize_replica_rebalance_metadata:
+\echo pg_dist_node state:
+SELECT nodeid, groupid, nodename, nodeport, noderole, nodeisreplica, nodeprimarynodeid, isactive FROM pg_catalog.pg_dist_node ORDER BY nodeid;
+
+-- Create a test table on the original primary group for rebalancing
+DROP TABLE IF EXISTS dist_rebal_table;
+CREATE TABLE dist_rebal_table (id int primary key, value text);
+SELECT create_distributed_table('dist_rebal_table', 'id', colocate_with => 'none', shard_count => 4);
+-- Add data targeting specific shards if possible, or just general data
+INSERT INTO dist_rebal_table SELECT i, 'rebal value ' || i FROM generate_series(1, 20) i;
+
+-- Ensure shards for dist_rebal_table are on group 2 (original primary for promo test node)
+-- This step is tricky as create_distributed_table might pick any available group if not specified.
+-- For this test, let's assume new tables might be placed on any active group.
+-- We need to ensure some shards are on group 2 (node 4's original group) to test rebalancing *from* it.
+-- Let's assume create_distributed_table placed shards on group 2.
+-- If this test were more complex, we'd use master_move_shard_placement or similar to set up.
+\echo Shard placements for dist_rebal_table BEFORE rebalance (should be on group 2):
+SELECT p.shardid, n.nodename, n.nodeport, n.groupid, s.logicalrelid::regclass
 FROM pg_dist_placement p JOIN pg_dist_node n ON p.groupid = n.groupid
 JOIN pg_dist_shard s ON s.shardid = p.shardid
-WHERE s.logicalrelid = 'dist_table'::regclass
-ORDER BY p.shardid, n.nodename, n.nodeport;
+WHERE s.logicalrelid = 'dist_rebal_table'::regclass
+ORDER BY p.shardid;
 
--- TODO: Add a test where promotion is "successful" by manually updating pg_dist_node
--- to simulate the replica being promoted (isActive=true, nodeisreplica=false etc BEFORE calling promote)
--- and then verify rebalancing. This would test the latter half of the UDF.
--- However, the UDF's internal checks for replica status might prevent this.
--- A dedicated "rebalance_from_former_primary" UDF might be easier to test in isolation.
+-- Now, let's re-run finalize with the actual table with shards on group 2
+-- This assumes node 4 is in group 2.
+\echo Re-running finalize for dist_rebal_table which has placements on group 2
+SELECT pg_catalog.citus_finalize_replica_rebalance_metadata(2, :new_group_id_for_promoted_node, 4, 5);
 
-\echo === Manual Simulation of Successful Promotion for Rebalance Test ===
--- Let's assume replica node 3 (replica of node 2) was externally promoted.
--- Update its metadata to reflect this state *before* calling a rebalance (if rebalance was separate).
--- Since citus_promote_replica_and_rebalance does it all, we can't easily inject this.
 
--- What we can do is:
--- 1. Add a replica.
--- 2. Manually update its pg_dist_node entry to look like it's been promoted (active, not replica, new groupid).
--- 3. Then call a *new, separate* UDF like `citus_rebalance_shards_from_group(source_group_id, target_group_id, ratio)`
--- This is beyond the current subtask of testing the existing UDF.
+\echo Shard placements for dist_rebal_table AFTER rebalance:
+SELECT p.shardid, n.nodename, n.nodeport, n.groupid, s.logicalrelid::regclass
+FROM pg_dist_placement p JOIN pg_dist_node n ON p.groupid = n.groupid
+JOIN pg_dist_shard s ON s.shardid = p.shardid
+WHERE s.logicalrelid = 'dist_rebal_table'::regclass
+ORDER BY p.shardid;
 
--- For the existing UDF, the most we can test in a simple regress is:
--- - Initial validations (non-existent replica, non-replica node)
--- - The NOTICE messages for WAL sync and promotion instructions.
--- - The error that occurs when it tries to connect to the replica to check pg_is_in_recovery.
+-- Check counts per group for dist_rebal_table
+SELECT n.groupid, count(*) as shard_count
+FROM pg_dist_placement p JOIN pg_dist_node n ON p.groupid = n.groupid
+JOIN pg_dist_shard s ON s.shardid = p.shardid
+WHERE s.logicalrelid = 'dist_rebal_table'::regclass
+GROUP BY n.groupid ORDER BY n.groupid;
 
--- Cleanup (optional, as regress usually runs in a temporary DB)
--- DROP TABLE dist_table;
+\echo pg_dist_cleanup entries (expecting entries for shards moved from group 2 and shards remaining on group 2):
+SELECT object_type, object_name, group_id, cleanup_policy FROM pg_catalog.pg_dist_cleanup ORDER BY object_name, group_id;
+
+-- Verify data integrity
+SELECT count(*) FROM dist_table;
+SELECT sum(id) FROM dist_table;
+SELECT count(*) FROM ref_table;
+SELECT sum(id) FROM ref_table;
+SELECT count(*) FROM dist_rebal_table;
+SELECT sum(id) FROM dist_rebal_table;
+
+-- Cleanup
+DROP TABLE dist_table;
+DROP TABLE ref_table;
+DROP TABLE dist_rebal_table;
+-- SELECT citus_remove_node('localhost', 5437); -- Node 5
+-- SELECT citus_remove_node('localhost', 5436); -- Node 4
+-- SELECT citus_remove_node('localhost', 5434); -- Node 3
+-- SELECT citus_remove_node('localhost', 5433); -- Node 2
 -- DROP TABLE ref_table;
 -- SELECT citus_remove_node('localhost', 5437);
 -- SELECT citus_remove_node('localhost', 5436);

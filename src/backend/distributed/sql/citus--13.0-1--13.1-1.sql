@@ -53,3 +53,5 @@ DROP VIEW IF EXISTS pg_catalog.citus_lock_waits;
 #include "udfs/citus_nodes/13.1-1.sql"
 #include "udfs/citus_add_replica_node/13.1-1.sql"
 #include "udfs/citus_promote_replica_and_rebalance/13.1-1.sql"
+#include "udfs/citus_internal_replica_rebalance_helpers.sql" /* Path relative to sql/ dir if structure is flat, or adjust path */
+#include "udfs/citus_finalize_replica_rebalance_metadata.sql"  /* Path relative to sql/ dir if structure is flat, or adjust path */

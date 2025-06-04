@@ -2,22 +2,19 @@
 
 ## Overview
 
-This feature allows you to expand your Citus cluster by adding a new worker node that starts its life as a PostgreSQL streaming replica of an existing Citus worker node. Once the replica is synchronized and promoted to a standalone primary, Citus can integrate it into the cluster and rebalance shard placements to it from its original primary.
+This feature allows you to expand your Citus cluster by adding a new worker node that starts its life as a PostgreSQL streaming replica of an existing Citus worker node. The process involves registering the replica, promoting it to a standalone PostgreSQL primary, updating Citus metadata to reflect this new primary, and then rebalancing shard placements from its original primary node to the new one.
 
-This process is useful for scenarios where you want to offload the initial data copying from the primary worker by leveraging PostgreSQL's built-in streaming replication.
+This approach is useful for minimizing the load of initial data copying on the primary worker by leveraging PostgreSQL's built-in streaming replication.
 
 The high-level workflow involves these stages:
 
 1.  **Manual PostgreSQL Replica Setup:** The database administrator manually sets up a new PostgreSQL instance as a streaming replica of an active Citus worker node. This is done using standard PostgreSQL replication procedures.
 2.  **Register Replica with Citus:** The administrator then registers this PostgreSQL replica with the Citus coordinator using the `citus_add_replica_node` UDF. This makes Citus aware of the replica and its relationship to the primary worker.
-3.  **Initiate Promotion and Rebalance:** When ready, the administrator calls the `citus_promote_replica_and_rebalance` UDF.
-4.  **Automated Orchestration by Citus:**
-    *   Citus temporarily blocks writes to the shards on the original primary node.
-    *   It monitors WAL (Write-Ahead Log) synchronization to ensure the replica is fully caught up with its primary.
-    *   Once synchronized, Citus prompts the administrator to perform the actual PostgreSQL promotion of the replica instance (e.g., using `pg_promote()`).
-    *   Citus waits for the replica's promotion to complete by monitoring its recovery state.
-    *   After the replica is promoted, Citus updates its metadata to reflect the new node as an active, primary worker with a new unique group ID.
-    *   Finally, Citus automatically rebalances approximately half of the shard placements from the original primary worker node to the newly promoted worker. Writes are then unblocked.
+3.  **Promote Replica and Update Node Metadata:** The administrator calls the `citus_promote_replica_and_rebalance` UDF. This UDF orchestrates:
+    *   Waiting for the replica to synchronize WAL with its primary.
+    *   Automatically promoting the PostgreSQL replica to a primary instance using `pg_promote()`.
+    *   Updating the replica's entry in `pg_catalog.pg_dist_node` to mark it as an active, primary Citus worker with a new, unique group ID.
+4.  **Finalize Shard Rebalance:** After the previous step is successful, the administrator calls the `citus_finalize_replica_rebalance_metadata` UDF. This function performs the metadata operations to reassign shard mastership, effectively rebalancing placements between the original primary and the newly promoted node.
 
 ## Prerequisites
 
@@ -25,11 +22,12 @@ The high-level workflow involves these stages:
 *   Successful configuration of PostgreSQL streaming replication from an existing, active Citus worker node (the "primary") to a new PostgreSQL instance (the "replica").
     *   Refer to the official PostgreSQL documentation for setting up streaming replication.
 *   The replica PostgreSQL instance must **not** yet be promoted to a primary when calling `citus_add_replica_node`. It should be a standby server, actively replicating.
-*   **Highly Recommended:** For reliable WAL lag monitoring by `citus_promote_replica_and_rebalance`, configure a unique `application_name` in the replica's `primary_conninfo` setting (in `postgresql.conf` or `recovery.conf` / `standby.signal` depending on your PostgreSQL version). It's good practice for this `application_name` to match the replica's hostname or be otherwise easily identifiable.
+*   **Highly Recommended:** For reliable WAL lag monitoring by `citus_promote_replica_and_rebalance`, configure a unique `application_name` in the replica's `primary_conninfo` setting (in `postgresql.conf` or `standby.signal` / `recovery.conf` depending on your PostgreSQL version). It's good practice for this `application_name` to match the replica's hostname or be otherwise easily identifiable.
+*   The PostgreSQL user connecting to the replica to run `pg_promote()` must have superuser privileges or sufficient permissions to execute `pg_promote()`.
 
 ## New User-Defined Functions (UDFs)
 
-Two new UDFs are introduced to manage this process:
+Three UDFs are involved in this process:
 
 ### `citus_add_replica_node`
 
@@ -62,67 +60,128 @@ Two new UDFs are introduced to manage this process:
     -- Assuming 'worker1.example.com:5432' is the primary Citus worker
     -- and 'replica1.example.com:5432' is its streaming replica.
     SELECT citus_add_replica_node('replica1.example.com', 5432, 'worker1.example.com', 5432);
-    -- Returns the new nodeid for replica1.example.com
+    -- Returns the new nodeid for replica1.example.com, e.g., 3
     ```
 
-### `citus_promote_replica_and_rebalance`
+### `citus_promote_replica_and_rebalance` (Now primarily `citus_promote_replica_node_metadata`)
 
 *   **Syntax:**
     ```sql
     citus_promote_replica_and_rebalance(replica_nodeid INT)
     RETURNS VOID
     ```
+    *(Note: The name `citus_promote_replica_and_rebalance` is kept for this step as per the subtask, but its role has focused. A rename to e.g., `citus_promote_replica_to_primary` might be clearer in the future.)*
 *   **Description:**
-    Orchestrates the promotion of a previously registered replica to become an active Citus worker. This includes waiting for WAL synchronization, prompting for PostgreSQL-level promotion, updating Citus metadata, and rebalancing a portion of shards from the original primary to the newly promoted node.
+    Orchestrates the promotion of a registered replica to an active Citus worker. This function handles waiting for WAL synchronization, attempts to automatically promote the PostgreSQL replica instance, and then updates its metadata in `pg_catalog.pg_dist_node` to reflect its new status as an active primary in a new group. **The actual shard placement rebalancing is now finalized by `citus_finalize_replica_rebalance_metadata`.**
 *   **Arguments:**
-    *   `replica_nodeid`: The `nodeid` (from `pg_catalog.pg_dist_node`) of the replica that was registered using `citus_add_replica_node`.
-*   **Workflow Stages Orchestrated by the UDF:**
-    1.  **Block Writes:** Temporarily blocks writes to shards located on the original primary node (the one the replica was replicating from) to ensure data consistency during the final sync and switchover.
-    2.  **WAL Sync Wait:** Connects to the original primary node and monitors `pg_stat_replication` to ensure the specified replica has replayed all WAL records and is fully caught up. The UDF attempts to identify the replica using its `application_name` (ideally matching the replica's hostname, as registered) or its client address. This stage has a configurable timeout (default: 5 minutes).
-    3.  **User Promotion Prompt & Wait:** Once the replica is caught up, the UDF issues a `NOTICE` message, prompting the database administrator to promote the PostgreSQL replica instance to a primary server (e.g., by running `pg_promote()` on the replica or using other promotion methods). The UDF then pauses and waits, periodically attempting to connect to the replica and checking if `pg_is_in_recovery()` returns `false`. This stage also has a configurable timeout (default: 5 minutes).
-    4.  **Metadata Update:** Upon successful detection of the replica's promotion (i.e., it's no longer in recovery), Citus updates its internal metadata. The replica node is marked as active (`isActive=true`), is no longer considered a replica (`nodeisreplica=false`, `nodeprimarynodeid=0`), is marked as ready to receive shards (`shouldHaveShards=true`), and is assigned a new, unique `groupid`.
-    5.  **Shard Rebalance:** Citus then rebalances a portion of the shard placements. For each colocation group that had shards on the original primary, approximately half of these shards are moved to the newly promoted worker.
-    6.  **Unblock Writes:** Write locks on the original primary's shards are released (typically at the end of the UDF's transaction).
+    *   `replica_nodeid`: The `nodeid` (from `pg_catalog.pg_dist_node`) of the replica previously registered with `citus_add_replica_node`.
+*   **Workflow Stages Orchestrated by this UDF:**
+    1.  **Blocks Writes:** Temporarily blocks writes to shards on the original primary node.
+    2.  **WAL Sync Wait:** Connects to the original primary node and monitors `pg_stat_replication` to ensure the specified replica has replayed all WAL records and is fully caught up. This step has a timeout (default: 5 minutes).
+    3.  **Automated PostgreSQL Promotion:** Connects to the replica node and executes `SELECT pg_promote(wait := true);` using SPI to promote the replica to a primary instance. The UDF then verifies the promotion by checking `pg_is_in_recovery()` on the replica. This step has a short timeout for verification.
+    4.  **Metadata Update:** After successful PostgreSQL promotion, Citus updates the replica's metadata in `pg_catalog.pg_dist_node`: the node is marked as active (`isActive=true`), no longer a replica (`nodeisreplica=false`, `nodeprimarynodeid=0`), is marked as ready to receive shards (`shouldHaveShards=true`), and is assigned a new, unique `groupid` (obtained via `citus_internal_get_next_group_id()`).
 *   **Important Notes:**
-    *   This is a long-running UDF due to the built-in waiting periods for WAL synchronization and replica promotion. It's recommended to run it in a session with an appropriate `statement_timeout`.
-    *   The actual promotion of the PostgreSQL replica (e.g., using `pg_promote()`) is an **external action** that the user must perform when prompted by the UDF. The UDF orchestrates around this external step but does not perform the PostgreSQL-level promotion itself.
-    *   If any step (WAL sync wait, promotion wait) times out, or if other errors occur (e.g., nodes becoming unavailable), the UDF will error out.
-    *   Due to the multi-stage nature of the process and its reliance on external actions and distributed state, the entire operation is not fully atomic in the traditional sense across the whole system. Metadata changes on the coordinator are transactional. If the UDF errors out after the user has promoted the PostgreSQL replica but before Citus metadata is updated, manual steps might be needed to register the new primary or clean up.
+    *   This is a long-running UDF due to the waiting periods. It's recommended to run it in a session with an appropriate `statement_timeout`.
+    *   If any step (WAL sync, `pg_promote` execution, promotion verification) times out or fails, the UDF will error out.
+    *   After this UDF successfully completes, the replica is an active Citus primary worker, but shard placements have **not** yet been rebalanced. The `citus_finalize_replica_rebalance_metadata` function must be called next.
+    *   The user must ensure that the PostgreSQL user that Citus uses to connect to the replica has permissions to execute `pg_promote()`.
 *   **Example:**
     ```sql
     -- Assuming replica node with nodeid 3 was added via citus_add_replica_node
     SELECT citus_promote_replica_and_rebalance(3);
+    -- On success, node 3 is now an active primary in a new group.
+    -- Writes on the original primary are unblocked upon this UDF's transaction completion.
+    ```
+
+### `citus_finalize_replica_rebalance_metadata`
+
+*   **Syntax:**
+    ```sql
+    citus_finalize_replica_rebalance_metadata(
+        original_primary_group_id INT,
+        new_primary_group_id INT,
+        original_primary_node_id INT,
+        new_primary_node_id INT
+    )
+    RETURNS VOID
+    ```
+*   **Description:**
+    Performs the metadata adjustments for shard placements after a replica has been promoted to a new primary worker by `citus_promote_replica_and_rebalance`. It distributes shard mastership (by count) between the original primary and the new primary for each colocation group.
+*   **Arguments:**
+    *   `original_primary_group_id`: The `groupid` of the worker node that was the original primary for the replica (before promotion).
+    *   `new_primary_group_id`: The new `groupid` assigned to the promoted replica by `citus_promote_replica_and_rebalance`.
+    *   `original_primary_node_id`: The `nodeid` of the original primary worker.
+    *   `new_primary_node_id`: The `nodeid` of the promoted replica (now the new primary).
+*   **Details:**
+    *   This function should be called **after** `citus_promote_replica_and_rebalance` has successfully run and the new primary node is active with its new group ID.
+    *   It calls an internal PL/pgSQL helper (`citus_internal_rebalance_placements_for_promoted_node`) which iterates through all colocation groups that had placements on the `original_primary_group_id`.
+    *   For each colocation group, it assigns approximately half the shards (by count, alternating) to remain with the `original_primary_group_id` and the other half to be mastered by the `new_primary_group_id`.
+    *   It updates `pg_catalog.pg_dist_placement` to reflect these new group assignments for shards.
+    *   It schedules the cleanup of physical shard data from the node that is no longer the master for a given shard by inserting records into `pg_catalog.pg_dist_cleanup`. For example, for a shard moved to the new primary, its data on the old primary is scheduled for cleanup. For a shard that remains on the old primary, its (replicated) data on the new primary is scheduled for cleanup.
+*   **Example:**
+    ```sql
+    -- After citus_promote_replica_and_rebalance(3) has successfully run:
+    -- Assume original primary was nodeid 2 in groupid 1.
+    -- Assume promoted replica (nodeid 3) was assigned new groupid 4.
+    SELECT pg_catalog.citus_finalize_replica_rebalance_metadata(
+        original_primary_group_id := 1,
+        new_primary_group_id := 4,
+        original_primary_node_id := 2,
+        new_primary_node_id := 3
+    );
     ```
 
 ## Example Workflow Summary
 
-1.  **DBA:** Set up a new PostgreSQL instance (`replica-new.example.com:5432`) as a streaming replica of an existing Citus worker (`worker-old.example.com:5432`). Ensure `primary_conninfo` on the replica includes an `application_name` (e.g., `replica-new.example.com`).
-2.  **DBA (on Citus coordinator):** Register the replica with Citus:
+1.  **DBA:** Set up a new PostgreSQL instance (`replica-new.example.com:5432`) as a streaming replica of an existing Citus worker (`worker-old.example.com:5432`). Ensure `primary_conninfo` on the replica includes an `application_name`.
+2.  **DBA (on Citus coordinator):** Register the replica:
     ```sql
-    SELECT citus_add_replica_node('replica-new.example.com', 5432, 'worker-old.example.com', 5432);
-    -- Note the returned replica_nodeid, let's say it's 5.
+    SELECT citus_add_replica_node('replica-new.example.com', 5432, 'worker-old.example.com', 5432) AS replica_nodeid;
+    -- Let's say this returns replica_nodeid = 5.
     ```
-3.  **DBA (on Citus coordinator):** Initiate the promotion and rebalance process:
+3.  **DBA (on Citus coordinator):** Promote the replica and update its Citus node metadata:
     ```sql
     SELECT citus_promote_replica_and_rebalance(5);
+    -- This function will block writes, wait for WAL sync, execute pg_promote() on replica 5,
+    -- verify promotion, then update pg_dist_node for node 5 (isactive=true, new groupid, etc.).
+    -- Note the NOTICE messages for progress.
     ```
-4.  **UDF:** Blocks writes on `worker-old`.
-5.  **UDF:** Waits for `replica-new` to catch up with WAL from `worker-old`.
-6.  **UDF:** Displays `NOTICE: Replica replica-new.example.com:5432 is caught up. Please promote it to a primary PostgreSQL instance NOW. ...`
-7.  **DBA:** Connects to `replica-new.example.com` and promotes it (e.g., `pg_ctl promote` or `pg_promote()`).
-8.  **UDF:** Detects that `replica-new` is no longer in recovery.
-9.  **UDF:** Updates Citus metadata: `replica-new` becomes an active primary in a new group.
-10. **UDF:** Moves approximately half the shards from `worker-old`'s group to `replica-new`'s new group.
-11. **UDF:** Completes, writes are unblocked.
-12. **Result:** `replica-new.example.com` is now an active Citus worker, sharing load with `worker-old.example.com`.
+4.  **DBA (on Citus coordinator):** After the previous command succeeds, gather necessary IDs. You'll need the original primary's group ID and node ID, and the newly promoted node's new group ID and its node ID.
+    ```sql
+    -- Example: Find original primary (worker-old) info
+    SELECT nodeid AS original_node_id, groupid AS original_group_id
+    FROM pg_catalog.pg_dist_node
+    WHERE nodename = 'worker-old.example.com' AND nodeport = 5432;
+    -- Let's say this returns original_node_id=2, original_group_id=1.
+
+    -- Example: Find promoted replica (replica-new, now a primary) info
+    SELECT nodeid AS promoted_node_id, groupid AS new_group_id
+    FROM pg_catalog.pg_dist_node
+    WHERE nodeid = 5;
+    -- Let's say this returns promoted_node_id=5, new_group_id=4 (assigned by previous UDF).
+    ```
+5.  **DBA (on Citus coordinator):** Finalize rebalancing by updating shard placement metadata:
+    ```sql
+    SELECT citus_finalize_replica_rebalance_metadata(
+        original_primary_group_id := 1,
+        new_primary_group_id := 4,
+        original_primary_node_id := 2,
+        new_primary_node_id := 5
+    );
+    -- This updates pg_dist_placement and schedules cleanups.
+    ```
+6.  **Result:** `replica-new.example.com` is now an active Citus worker, sharing load approximately 50/50 (by shard count per colocation group) with `worker-old.example.com`. Data cleanup tasks are scheduled.
 
 ## Considerations and Limitations
 
-*   **Concurrency for Group ID:** The mechanism for assigning a new `groupid` to the promoted replica should ensure uniqueness even with concurrent operations. The current implementation uses a temporary, non-concurrency-safe method (`max(groupid) + 1`) as a placeholder due to internal access constraints for the preferred sequence-based `GetNextGroupId()` function. This aspect is marked for improvement.
-*   **Replica Identification:** The reliability of detecting the replica in `pg_stat_replication` (for WAL lag checking) is highest when `application_name` is consistently set in the replica's configuration and matches what the UDF expects (e.g., the replica's hostname).
-*   **Atomicity and Failure Recovery:** While operations on the Citus coordinator are transactional, the end-to-end process involves external systems (PostgreSQL replication and promotion) and distributed operations (shard movement).
-    *   If the UDF fails before the user promotes the replica, the situation is generally recoverable by addressing the issue and re-running the UDF, or by manually cleaning up the registered replica entry using `citus_remove_node()`.
-    *   If the UDF fails *after* the user has promoted the replica but *before* Citus metadata is fully updated and shards are rebalanced, the newly promoted PostgreSQL instance will be a standalone primary. Manual intervention might be needed to either add it as a new standard worker node to Citus (using `citus_add_node`) or to troubleshoot the failed `citus_promote_replica_and_rebalance` call. The original primary will still have all its shards and writes would have been blocked by the UDF; these locks are released if the UDF transaction aborts.
-*   **Shard Rebalancing Strategy:** The current rebalancing strategy moves approximately 50% of the shard load (per colocation group) from the original primary to the new one. This is a fixed strategy. For more fine-grained control, subsequent manual shard rebalancer commands can be used.
-*   **Network and Node Availability:** The process relies on network connectivity between the coordinator and both the primary and replica nodes at various stages. Ensure nodes are accessible and PostgreSQL instances are running.
-*   **Monitoring:** It is crucial to monitor the PostgreSQL logs on both the original primary and the replica, as well as the Citus coordinator logs, during this operation.
+*   **Two-Stage Process:** The promotion and rebalancing is now a two-stage process requiring calls to two UDFs: `citus_promote_replica_and_rebalance` followed by `citus_finalize_replica_rebalance_metadata`. Ensure both are run in the correct order.
+*   **Replica Identification for WAL Sync:** The reliability of detecting the replica in `pg_stat_replication` (for WAL lag checking within `citus_promote_replica_and_rebalance`) is highest when `application_name` is consistently set in the replica's configuration.
+*   **Permissions for `pg_promote`:** The database user that Citus uses to connect to the replica node (during `citus_promote_replica_and_rebalance`) must have permissions to execute `pg_promote()`. This typically means superuser.
+*   **Atomicity and Failure Recovery:**
+    *   Operations on the Citus coordinator are generally transactional.
+    *   The `pg_promote()` call is external to the coordinator's transaction. If `citus_promote_replica_and_rebalance` fails after `pg_promote()` has been executed but before Citus metadata is updated, the replica will be a standalone PostgreSQL primary but not yet a fully integrated Citus primary worker. Manual metadata adjustments or re-running parts of the process might be needed.
+    *   `citus_finalize_replica_rebalance_metadata` performs metadata changes. If it fails, placements might be in an intermediate state.
+*   **Shard Rebalancing Strategy:** The current rebalancing strategy in `citus_finalize_replica_rebalance_metadata` distributes shards by count (alternating) within each colocation group. It does not consider shard size or load. For more sophisticated rebalancing, consider using `rebalance_table_shards()` or other manual shard movement commands after the new node is fully integrated.
+*   **Network and Node Availability:** The process relies on network connectivity between the coordinator and both the original primary and replica nodes at various stages.
+*   **Monitoring:** It is crucial to monitor PostgreSQL logs on all involved nodes (coordinator, original primary, replica) and Citus coordinator logs during these operations.
+*   **`pg_dist_cleanup` Table:** The rebalancing process schedules cleanup tasks by inserting into `pg_catalog.pg_dist_cleanup`. Ensure that the Citus maintenance daemon or a similar mechanism is active to process these cleanup records.

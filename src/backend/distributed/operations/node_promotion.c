@@ -28,6 +28,11 @@
 #include "distributed/metadata/node_metadata.h" // For GetNextGroupId (needs to be exposed or reimplemented)
 #include "utils/hsearch.h" // For hash table operations
 #include "utils/memutils.h" // For MemoryContext related operations
+#include "distributed/shardid_utils.h" // For GetQualifiedShardName, ShardInterval
+#include "distributed/shard_cleaner.h" // For InsertCleanupRecordOutsideTransaction
+#include "catalog/pg_dist_placement.h" // For DistPlacementRelationId
+#include "catalog/pg_dist_shard.h" // For ShardInterval
+#include "nodes/pg_list.h" // For List operations
 
 // May need more includes as we implement
 
@@ -265,84 +270,102 @@ citus_promote_replica_and_rebalance(PG_FUNCTION_ARGS)
 						   replicaNode->workerName, replicaNode->workerPort,
 						   primaryNode->workerName, primaryNode->workerPort)));
 
-	// Step 3: Instruct User & Wait for PostgreSQL Replica Promotion
-	ereport(NOTICE, (errmsg("Step 3: Replica %s:%d is caught up. Please promote it to a primary PostgreSQL instance NOW. "
-						   "The UDF will wait for up to %d minutes for the promotion to complete.",
-						   replicaNode->workerName, replicaNode->workerPort, catchUpTimeoutSeconds / 60)));
+	// Step 3: Automate PostgreSQL Replica Promotion
+	ereport(NOTICE, (errmsg("Step 3: Attempting to promote replica %s:%d via pg_promote().",
+						   replicaNode->workerName, replicaNode->workerPort)));
 
 	bool replicaPromoted = false;
-	const int promotionTimeoutSeconds = 300; // 5 minutes, should ideally be separate GUC or related to catchUpTimeout
-	elapsedTimeSeconds = 0; // Reset for this new wait period
-
-	while (elapsedTimeSeconds < promotionTimeoutSeconds)
+	MultiConnection *replicaConnectionToPromote = NULL;
+	PG_TRY();
 	{
-		MultiConnection *replicaConnection = NULL;
-		bool isInRecovery = true; // Assume in recovery until proven otherwise
+		// Ensure this connection can perform superuser operations like pg_promote.
+		// This might require specific connection string parameters or server-side config.
+		// For now, assume GetNodeConnection provides a sufficiently privileged connection.
+		replicaConnectionToPromote = GetNodeConnection(CONNECTION_PRIORITY_INVALID,
+											 replicaNode->workerName,
+											 replicaNode->workerPort);
 
-		PG_TRY();
+		char *promoteQuery = "SELECT pg_promote(wait := true);";
+		PushActiveSnapshot(GetTransactionSnapshot()); // SPI context
+		SPI_connect();
+		if (SPI_execute(promoteQuery, false, 0) == SPI_OK_UTILITY) // pg_promote is UTILITY
 		{
-			replicaConnection = GetNodeConnection(CONNECTION_PRIORITY_INVALID,
-												 replicaNode->workerName,
-												 replicaNode->workerPort);
+			// For `wait := true`, successful execution means promotion occurred.
+			// However, pg_promote() itself returns VOID. We check execution status.
+			// To be absolutely sure, we should check pg_is_in_recovery() AFTER this.
+			replicaPromoted = true; // Assume success if command completes without error
+		}
+		else
+		{
+			// SPI_execute for utility commands that return void might still be SPI_OK_UTILITY
+			// but we might want to check for errors specifically.
+			// If pg_promote itself fails (e.g. not a replica, already promoted), it errors.
+			// An explicit check of pg_is_in_recovery() after this is safer.
+			ereport(WARNING, (errmsg("pg_promote command sent, but verify promotion status for %s:%d.",
+								   replicaNode->workerName, replicaNode->workerPort)));
+		}
+		SPI_finish();
+		PopActiveSnapshot();
 
-			char *recoveryCheckQuery = "SELECT pg_is_in_recovery();";
-			PushActiveSnapshot(GetTransactionSnapshot());
-			SPI_connect();
-			if (SPI_execute(recoveryCheckQuery, true, 1) == SPI_OK_SELECT && SPI_processed > 0)
+		if (replicaConnectionToPromote)
+		{
+			ReleaseNodeConnection(replicaConnectionToPromote);
+			replicaConnectionToPromote = NULL;
+		}
+	}
+	PG_CATCH();
+	{
+		if (replicaConnectionToPromote)
+		{
+			ReleaseNodeConnection(replicaConnectionToPromote);
+		}
+		FlushErrorState();
+		ereport(ERROR, (errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
+						errmsg("Failed to execute pg_promote() on replica %s:%d: %s",
+							   replicaNode->workerName, replicaNode->workerPort, SDL_GetErrMessage(NULL))));
+	}
+	PG_END_TRY();
+
+	// After attempting pg_promote, verify by checking pg_is_in_recovery()
+	if (replicaPromoted) // Only check if pg_promote utility command itself didn't error
+	{
+		bool isInRecovery = true;
+		int checkAttempts = 5; // Try a few times as promotion might take a moment
+		for (int i = 0; i < checkAttempts; ++i)
+		{
+			PG_TRY();
 			{
-				bool isnull;
-				Datum recoveryDatum = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull);
-				if (!isnull)
+				replicaConnectionToPromote = GetNodeConnection(CONNECTION_PRIORITY_INVALID, replicaNode->workerName, replicaNode->workerPort);
+				PushActiveSnapshot(GetTransactionSnapshot());
+				SPI_connect();
+				if (SPI_execute("SELECT pg_is_in_recovery();", true, 1) == SPI_OK_SELECT && SPI_processed > 0)
 				{
-					isInRecovery = DatumGetBool(recoveryDatum);
+					Datum recoveryDatum = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isInRecovery);
+					isInRecovery = isnull ? true : DatumGetBool(recoveryDatum);
 				}
+				SPI_finish();
+				PopActiveSnapshot();
+				if (replicaConnectionToPromote) ReleaseNodeConnection(replicaConnectionToPromote); replicaConnectionToPromote = NULL;
 			}
-			else {
-				 // If query fails, replica might not be fully up or accepting queries yet
-				 ereport(WARNING, (errmsg("Failed to query pg_is_in_recovery() on %s:%d. Retrying...",
-									   replicaNode->workerName, replicaNode->workerPort)));
-			}
-			SPI_finish();
-			PopActiveSnapshot();
-
-			if (replicaConnection)
+			PG_CATCH();
 			{
-				ReleaseNodeConnection(replicaConnection);
-				replicaConnection = NULL;
+				if (replicaConnectionToPromote) ReleaseNodeConnection(replicaConnectionToPromote); replicaConnectionToPromote = NULL;
+				FlushErrorState(); // Ignore error, will retry or fail below
 			}
-		}
-		PG_CATCH();
-		{
-			if (replicaConnection)
-			{
-				ReleaseNodeConnection(replicaConnection);
-			}
-			FlushErrorState();
-			ereport(WARNING, (errmsg("Error connecting to replica %s:%d to check promotion status: %s. Retrying...",
-									 replicaNode->workerName, replicaNode->workerPort, SDL_GetErrMessage(NULL))));
-			// Fall through to sleep and retry
-		}
-		PG_END_TRY();
+			PG_END_TRY();
 
-		if (!isInRecovery)
-		{
-			replicaPromoted = true;
-			break;
+			if (!isInRecovery) break;
+			pg_usleep(1000000L); // 1 second
 		}
-
-		ereport(NOTICE, (errmsg("Waiting for replica %s:%d to be promoted... (currently in_recovery=%s)",
-							   replicaNode->workerName, replicaNode->workerPort, isInRecovery ? "true" : "false")));
-		pg_usleep(sleepIntervalSeconds * 1000000L);
-		elapsedTimeSeconds += sleepIntervalSeconds;
+		replicaPromoted = !isInRecovery;
 	}
 
 	if (!replicaPromoted)
 	{
 		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-						errmsg("Replica %s:%d was not promoted within %d seconds.",
-							   replicaNode->workerName, replicaNode->workerPort, promotionTimeoutSeconds)));
+						errmsg("Replica %s:%d failed to promote or promotion could not be confirmed.",
+							   replicaNode->workerName, replicaNode->workerPort)));
 	}
-
 	ereport(NOTICE, (errmsg("Replica %s:%d has been successfully promoted.",
 						   replicaNode->workerName, replicaNode->workerPort)));
 
@@ -365,53 +388,43 @@ citus_promote_replica_and_rebalance(PG_FUNCTION_ARGS)
 	// For now, let's simulate getting a new group ID. This part would need proper implementation.
 	// A temporary workaround could be to find max(groupid) + 1 via SPI if GetNextGroupId is not callable.
 	// For this exercise, we'll assign a symbolic value and note this needs real implementation.
-	// newGroupId = GetNextGroupId(); // This is the ideal call.
+	// newGroupId = GetNextGroupId(); // This was the ideal call, but direct C linkage was problematic.
 
-	// Temporary workaround for GetNextGroupId: Use SPI to get max(groupid) + 1.
-	// WARNING: THIS IS NOT CONCURRENCY SAFE AND NOT FOR PRODUCTION.
-	// It is used here due to difficulties making GetNextGroupId() from node_metadata.c directly callable.
-	// A proper solution involves exposing GetNextGroupId or using a sequence via a helper UDF.
-	ereport(WARNING, (errmsg("Using a temporary, non-production-safe method to determine new group ID. "
-						   "This should be replaced by a call to a centrally managed sequence (e.g., GetNextGroupId).")));
+	// Call the SQL helper function to get the next group ID from the sequence.
+	ereport(NOTICE, (errmsg("Obtaining new group ID from sequence via SQL helper function.")));
 
+	PushActiveSnapshot(GetTransactionSnapshot()); // Ensure snapshot for SPI
 	SPI_connect();
-	if (SPI_execute("SELECT max(groupid) + 1 FROM pg_catalog.pg_dist_node;", true, 1) == SPI_OK_SELECT && SPI_processed > 0)
+	if (SPI_execute("SELECT pg_catalog.citus_internal_get_next_group_id();", true, 1) == SPI_OK_SELECT && SPI_processed > 0)
 	{
 		bool isnull;
-		Datum maxGroupIdPlusOne = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull);
-		if (isnull) {
-			newGroupId = 1; // Should not happen if there are nodes, but as a fallback.
-		} else {
-			newGroupId = DatumGetInt32(maxGroupIdPlusOne);
+		Datum nextGroupIdDatum = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull);
+		if (isnull)
+		{
+			SPI_finish();
+			PopActiveSnapshot();
+			ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+							errmsg("citus_internal_get_next_group_id() returned NULL.")));
 		}
+		newGroupId = DatumGetInt32(nextGroupIdDatum);
 	}
 	else
 	{
+		int spi_error_code = SPI_get_result(); // Capture error code before SPI_finish
 		SPI_finish();
+		PopActiveSnapshot();
 		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
-						errmsg("Could not determine next group ID using SPI.")));
+						errmsg("Failed to execute citus_internal_get_next_group_id(): %s",
+							   SPI_result_code_string(spi_error_code))));
 	}
 	SPI_finish();
+	PopActiveSnapshot();
 
-	// Ensure the newGroupId is not the coordinator group id, unless it's the only possible one.
-	if (newGroupId == COORDINATOR_GROUP_ID) {
-		// This logic might need refinement based on how group IDs are typically assigned.
-		// If max(groupid) was -1 (no user groups), max+1 could be 0.
-		// A robust GetNextGroupId would handle this by starting sequences appropriately.
-		List *allNodes = ReadDistNode(true); // includeNodesFromOtherClusters = true
-		if (list_length(allNodes) > 0) { // If there are ANY nodes, 0 is reserved.
-			 newGroupId = 1; // Start with 1 if 0 is taken by coordinator and no other groups exist
-			 ListCell *nodeCell;
-			 foreach(nodeCell, allNodes) {
-				 WorkerNode *n = (WorkerNode *) lfirst(nodeCell);
-				 if (n->groupId >= newGroupId) {
-					 newGroupId = n->groupId + 1;
-				 }
-			 }
-		}
-		list_free_deep(allNodes);
+	if (newGroupId == 0) // Double check, though SQL function should prevent this.
+	{
+		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+						errmsg("Obtained group ID 0 from sequence, which is invalid for new groups.")));
 	}
-
 
 	pgDistNodeRel = table_open(DistNodeRelationId(), RowExclusiveLock); // Already locked, but good for clarity
 	tupleDescriptor = RelationGetDescr(pgDistNodeRel);

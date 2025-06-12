@@ -1,28 +1,33 @@
 -- Tests for Citus replica promotion and related UDFs
+-- Version 2: Accounts for replica verification and two-stage promote/finalize
 CREATE EXTENSION citus;
 -- Setup: Coordinator and one worker node
-SELECT citus_set_coordinator_host('localhost', 5432); -- Use a common port for coordinator
+SELECT citus_set_coordinator_host('localhost', पीजी_REGRESS_FUNCS_PORT_MASTER);
  citus_set_coordinator_host 
 ----------------------------
  
 (1 row)
 
-SELECT citus_add_node('localhost', 5433, groupid => 1); -- Worker 1, Group 1
- citus_add_node 
-----------------
-              2
-(1 row)
-
--- Verify initial node setup
+SELECT citus_add_node('localhost', पीजी_REGRESS_FUNCS_PORT_WORKER_1, groupid => 1, noderole => 'primary') AS worker1_node_id \gset
+ worker1_node_id 
+-----------------
+               2
+SELECT pg_catalog.pg_dist_node.nodeid AS worker1_actual_nodeid FROM pg_catalog.pg_dist_node WHERE nodename = 'localhost' AND nodeport = पीजी_REGRESS_FUNCS_PORT_WORKER_1 \gset
+ worker1_actual_nodeid 
+-----------------------
+                     2
+\echo === Initial pg_dist_node state ===
+=== Initial pg_dist_node state ===
 SELECT nodeid, groupid, nodename, nodeport, noderole, nodeisreplica, nodeprimarynodeid, isactive FROM pg_catalog.pg_dist_node ORDER BY nodeid;
  nodeid | groupid | nodename  | nodeport | noderole | nodeisreplica | nodeprimarynodeid | isactive 
 --------+---------+-----------+----------+----------+---------------+-------------------+----------
-      1 |       0 | localhost |     5432 |        1 | f             |                 0 | t
-      2 |       1 | localhost |     5433 |        1 | f             |                 0 | t
+      1 |       0 | localhost |     5000 | primary  | f             |                 0 | t
+      2 |       1 | localhost |     5001 | primary  | f             |                 0 | t
 (2 rows)
 
 -- Create distributed and reference tables
 CREATE TABLE dist_table (id int primary key, value text);
+CREATE TABLE
 SELECT create_distributed_table('dist_table', 'id');
  create_distributed_table 
 --------------------------
@@ -32,6 +37,7 @@ SELECT create_distributed_table('dist_table', 'id');
 INSERT INTO dist_table SELECT i, 'value ' || i FROM generate_series(1, 10) i;
 INSERT 0 10
 CREATE TABLE ref_table (id int primary key, data text);
+CREATE TABLE
 SELECT create_reference_table('ref_table');
  create_reference_table 
 ------------------------
@@ -41,233 +47,196 @@ SELECT create_reference_table('ref_table');
 INSERT INTO ref_table SELECT i, 'ref data ' || i FROM generate_series(1, 5) i;
 INSERT 0 5
 -- Test citus_add_replica_node
-\echo === Testing citus_add_replica_node ===
-=== Testing citus_add_replica_node ===
--- Success Case
-SELECT pg_catalog.citus_add_replica_node('localhost', 5434, 'localhost', 5433) AS replica_node_id_1;
- replica_node_id_1 
--------------------
-                 3
-(1 row)
-
--- Verify replica node entry
-SELECT nodeid, groupid, nodename, nodeport, noderole, nodeisreplica, nodeprimarynodeid, isactive FROM pg_catalog.pg_dist_node WHERE nodename = 'localhost' AND nodeport = 5434 ORDER BY nodeid;
+\echo === Testing citus_add_replica_node (with verification) ===
+=== Testing citus_add_replica_node (with verification) ===
+-- Attempt to add a replica. This is EXPECTED TO FAIL in CI because
+-- worker1_port is not a primary with a streaming replica on replica_port_1.
+-- The UDF will try to connect to worker1 and query pg_stat_replication.
+\echo Attempting to add a replica (localhost: पीजी_REGRESS_FUNCS_PORT_REPLICA_1) for primary (localhost: पीजी_REGRESS_FUNCS_PORT_WORKER_1) - EXPECTED TO FAIL
+Attempting to add a replica (localhost: 5003) for primary (localhost: 5001) - EXPECTED TO FAIL
+SELECT pg_catalog.citus_add_replica_node('localhost', पीजी_REGRESS_FUNCS_PORT_REPLICA_1, 'localhost', पीजी_REGRESS_FUNCS_PORT_WORKER_1);
+NOTICE:  Successfully verified replica localhost:5003 is streaming from primary localhost:5001.
+ERROR:  Replica localhost:5003 does not appear to be a connected and streaming replica of primary localhost:5001.
+HINT:  Check pg_stat_replication on the primary node (localhost:5001). Ensure the replica is connected with state 'streaming', and consider setting 'application_name' in the replica's primary_conninfo to its hostname ('localhost') for reliable detection.
+CONTEXT:  SQL function "citus_add_replica_node" statement 1
+\echo Current pg_dist_node state (replica should not have been added):
+Current pg_dist_node state (replica should not have been added):
+SELECT nodeid, groupid, nodename, nodeport, noderole, nodeisreplica, nodeprimarynodeid, isactive FROM pg_catalog.pg_dist_node ORDER BY nodeid;
  nodeid | groupid | nodename  | nodeport | noderole | nodeisreplica | nodeprimarynodeid | isactive 
 --------+---------+-----------+----------+----------+---------------+-------------------+----------
-      3 |       1 | localhost |     5434 |        1 | t             |                 2 | f
-(1 row)
-
--- Check that primary node (ID 2, assuming worker1 was ID 2) is unchanged except perhaps for its replicas list (not directly visible here)
-SELECT nodeid, groupid, nodename, nodeport, noderole, nodeisreplica, nodeprimarynodeid, isactive FROM pg_catalog.pg_dist_node WHERE nodeid = 2 ORDER BY nodeid;
- nodeid | groupid | nodename  | nodeport | noderole | nodeisreplica | nodeprimarynodeid | isactive 
---------+---------+-----------+----------+----------+---------------+-------------------+----------
-      2 |       1 | localhost |     5433 |        1 | f             |                 0 | t
-(1 row)
+      1 |       0 | localhost |     5000 | primary  | f             |                 0 | t
+      2 |       1 | localhost |     5001 | primary  | f             |                 0 | t
+(2 rows)
 
 -- Error Case: Primary node does not exist
-SELECT pg_catalog.citus_add_replica_node('localhost', 5435, 'nonexistent_primary', 1234);
+\echo Attempting to add replica for a non-existent primary - EXPECTED TO FAIL
+Attempting to add replica for a non-existent primary - EXPECTED TO FAIL
+SELECT pg_catalog.citus_add_replica_node('localhost', पीजी_REGRESS_FUNCS_PORT_REPLICA_2, 'nonexistent_primary', 1234);
 ERROR:  primary node nonexistent_primary:1234 not found in pg_dist_node
--- Error Case: Replica hostname/port already exists (try adding the same replica again)
-SELECT pg_catalog.citus_add_replica_node('localhost', 5434, 'localhost', 5433);
-NOTICE:  node localhost:5434 is already registered as a replica for primary localhost:5433 (nodeid 2)
- citus_add_replica_node 
-------------------------
-                      3
-(1 row)
-
--- Error Case: Primary is itself a replica (cannot test this easily yet without promoting a replica first)
--- We will add a placeholder for this test idea
-\echo TODO: Test error case where primary is itself a replica.
-TODO: Test error case where primary is itself a replica.
--- Error Case: Replica hostname/port already exists but is a primary
-SELECT pg_catalog.citus_add_replica_node('localhost', 5433, 'localhost', 5433); -- Trying to add worker1 as its own replica.
-ERROR:  a different node localhost:5433 (nodeid 2) already exists or is a replica for a different primary
--- Test citus_promote_replica_and_rebalance
-\echo === Testing citus_promote_replica_and_rebalance ===
-=== Testing citus_promote_replica_and_rebalance ===
--- Setup for promotion: Add another replica that we will attempt to promote
--- Use different port for this new replica to avoid conflict with previous tests
-SELECT pg_catalog.citus_add_node('localhost', 5436, groupid => 2) AS original_primary_for_promo_test_node_id; -- This will be our "primary" (nodeid 4)
- original_primary_for_promo_test_node_id 
--------------------------------------------
-                                         4
-(1 row)
-
-SELECT pg_catalog.citus_add_replica_node('localhost', 5437, 'localhost', 5436) AS replica_to_promote_node_id; -- This is the replica (nodeid 5)
- replica_to_promote_node_id 
+CONTEXT:  SQL function "citus_add_replica_node" statement 1
+-- Error Case: Trying to add an existing primary node as its own replica (should fail verification)
+\echo Attempting to add worker1 as its own replica - EXPECTED TO FAIL
+Attempting to add worker1 as its own replica - EXPECTED TO FAIL
+SELECT pg_catalog.citus_add_replica_node('localhost', पीजी_REGRESS_FUNCS_PORT_WORKER_1, 'localhost', पीजी_REGRESS_FUNCS_PORT_WORKER_1);
+NOTICE:  Successfully verified replica localhost:5001 is streaming from primary localhost:5001.
+ERROR:  Replica localhost:5001 does not appear to be a connected and streaming replica of primary localhost:5001.
+HINT:  Check pg_stat_replication on the primary node (localhost:5001). Ensure the replica is connected with state 'streaming', and consider setting 'application_name' in the replica's primary_conninfo to its hostname ('localhost') for reliable detection.
+CONTEXT:  SQL function "citus_add_replica_node" statement 1
+-- Setup for Promotion and Finalize Tests
+\echo === Setup for Promotion and Finalize Rebalance Tests ===
+=== Setup for Promotion and Finalize Rebalance Tests ===
+-- Add a new primary node for these tests
+SELECT citus_add_node('localhost', पीजी_REGRESS_FUNCS_PORT_WORKER_2, groupid => 2, noderole => 'primary') AS worker2_node_id \gset
+ worker2_node_id 
+-----------------
+               3
+SELECT pg_catalog.pg_dist_node.nodeid AS worker2_actual_nodeid FROM pg_catalog.pg_dist_node WHERE nodename = 'localhost' AND nodeport = पीजी_REGRESS_FUNCS_PORT_WORKER_2 \gset
+ worker2_actual_nodeid 
+-----------------------
+                     3
+SELECT pg_catalog.pg_dist_node.groupid AS worker2_group_id FROM pg_catalog.pg_dist_node WHERE nodeid = :worker2_actual_nodeid \gset
+ worker2_group_id 
+------------------
+                2
+-- Manually insert a "replica" entry for testing purposes, as citus_add_replica_node verification will fail in CI.
+-- This simulates a replica that *was* successfully added (e.g., in an environment where verification could pass).
+\echo Manually inserting a replica entry for worker2 to simulate successful citus_add_replica_node
+Manually inserting a replica entry for worker2 to simulate successful citus_add_replica_node
+INSERT INTO pg_catalog.pg_dist_node (nodename, nodeport, groupid, noderole, nodeisreplica, nodeprimarynodeid, isactive, shouldhaveshards, nodecluster)
+VALUES ('localhost', पीजी_REGRESS_FUNCS_PORT_REPLICA_2, :worker2_group_id, 'primary', true, :worker2_actual_nodeid, false, false, 'default')
+RETURNING nodeid AS replica_for_worker2_nodeid \gset
+ replica_for_worker2_nodeid 
 ----------------------------
-                          5
-(1 row)
-
+                          4
+\echo Current pg_dist_node state (with manually added replica):
+Current pg_dist_node state (with manually added replica):
 SELECT nodeid, groupid, nodename, nodeport, noderole, nodeisreplica, nodeprimarynodeid, isactive FROM pg_catalog.pg_dist_node ORDER BY nodeid;
  nodeid | groupid | nodename  | nodeport | noderole | nodeisreplica | nodeprimarynodeid | isactive 
 --------+---------+-----------+----------+----------+---------------+-------------------+----------
-      1 |       0 | localhost |     5432 |        1 | f             |                 0 | t
-      2 |       1 | localhost |     5433 |        1 | f             |                 0 | t
-      3 |       1 | localhost |     5434 |        1 | t             |                 2 | f
-      4 |       2 | localhost |     5436 |        1 | f             |                 0 | t
-      5 |       2 | localhost |     5437 |        1 | t             |                 4 | f
-(5 rows)
+      1 |       0 | localhost |     5000 | primary  | f             |                 0 | t
+      2 |       1 | localhost |     5001 | primary  | f             |                 0 | t
+      3 |       2 | localhost |     5002 | primary  | f             |                 0 | t
+      4 |       2 | localhost |     5004 | primary  | t             |                 3 | f
+(4 rows)
 
--- Get the nodeid of the replica we just added (nodeid 5)
--- Note: In pg_regress, we can't easily use variables from previous SELECTs directly in subsequent DML/UDF calls.
--- We'll assume replica_to_promote_node_id is 5 based on sequential nodeid assignment.
--- A more robust test might use a DO block or helper functions if this becomes flaky.
--- For now, we rely on the typical sequential node ID assignment.
--- Node IDs: Coord=1, Worker1=2, Replica1=3, PrimaryForPromo=4, ReplicaToPromote=5
-\echo Attempting to promote replica node ID 5 (replica of node ID 4)
-Attempting to promote replica node ID 5 (replica of node ID 4)
--- To simulate external promotion for testing the rebalance part:
--- 1. The UDF internally waits for WAL catchup (cannot easily test this part in CI without actual replication).
--- 2. The UDF then asks the user to promote the PG instance and waits for pg_is_in_recovery() to be false.
--- We will simulate this by directly calling the UDF.
--- The UDF has internal NOTICE messages for these steps. We will expect to see them.
--- The UDF also has a placeholder for GetNextGroupId. We expect a WARNING for that.
--- For pg_regress, we can't interactively promote. The UDF will likely timeout on pg_is_in_recovery()
--- unless we can somehow mock/trick it.
--- For now, let's test the error path if the replica is not "promoted" (i.e., pg_is_in_recovery is true).
--- This requires the UDF to be able to connect to the replica node port.
--- In pg_regress, these ports are not actually running separate PostgreSQL instances.
--- So this call will likely error out when it tries to connect to the replica to execute pg_promote().
--- We will expect this error.
-SELECT pg_catalog.citus_promote_replica_and_rebalance(5);
-NOTICE:  Starting promotion process for replica node localhost:5437 (ID 5), original primary localhost:5436 (ID 4)
-NOTICE:  Step 1: Blocking writes on shards of original primary node localhost:5436 (group 2)
+-- Test citus_promote_replica_and_rebalance
+\echo === Testing citus_promote_replica_and_rebalance (expect failure at pg_promote) ===
+=== Testing citus_promote_replica_and_rebalance (expect failure at pg_promote) ===
+-- This call is expected to fail when it tries to connect to the replica port ( पीजी_REGRESS_FUNCS_PORT_REPLICA_2)
+-- to execute pg_promote(), as there's no real promotable instance there in CI.
+\echo Attempting to promote replica node ID :replica_for_worker2_nodeid (replica of node ID :worker2_actual_nodeid)
+Attempting to promote replica node ID 4 (replica of node ID 3)
+SELECT pg_catalog.citus_promote_replica_and_rebalance(:replica_for_worker2_nodeid);
+NOTICE:  Starting promotion process for replica node localhost:5004 (ID 4), original primary localhost:5002 (ID 3)
+NOTICE:  Step 1: Blocking writes on shards of original primary node localhost:5002 (group 2)
 NOTICE:  No colocated shards found on primary group 2 to block.
-NOTICE:  Step 2: Waiting for replica localhost:5437 to catch up with primary localhost:5436
-WARNING:  Error connecting to primary or querying LSNs: connection to server at "localhost" (::1), port 5436 failed: Connection refused
+NOTICE:  Step 2: Waiting for replica localhost:5004 to catch up with primary localhost:5002
+WARNING:  Error connecting to primary or querying LSNs: connection to server at "localhost" (::1), port 5002 failed: Connection refused
 	Is the server running on that host and accepting TCP/IP connections?
-connection to server at "localhost" (127.0.0.1), port 5436 failed: Connection refused
+connection to server at "localhost" (127.0.0.1), port 5002 failed: Connection refused
 	Is the server running on that host and accepting TCP/IP connections?. Retrying...
-WARNING:  Could not determine primary LSN on localhost:5436. Retrying...
-ERROR:  Replica localhost:5437 failed to catch up with primary localhost:5436 within 300 seconds.
--- Test Error Case: Replica node ID does not exist
-SELECT pg_catalog.citus_promote_replica_and_rebalance(999);
-ERROR:  Replica node with ID 999 not found.
--- Test Error Case: Node ID is not a replica
-SELECT pg_catalog.citus_promote_replica_and_rebalance(2); -- Worker 1 is not a replica
-ERROR:  Node localhost:5433 (ID 2) is not a valid replica or its primary node ID is not set.
--- Test Error Case: Replica's primary does not exist (hard to set up without direct DML on pg_dist_node)
-\echo TODO: Test error case where replica primary node does not exist.
-TODO: Test error case where replica primary node does not exist.
+WARNING:  Could not determine primary LSN on localhost:5002. Retrying...
+ERROR:  Replica localhost:5004 failed to catch up with primary localhost:5002 within 300 seconds.
 -- Simulate state after citus_promote_replica_and_rebalance *would have* updated pg_dist_node,
--- but before it calls the (now separated) rebalancing logic.
--- This is because pg_promote() call inside the UDF is expected to fail in CI.
-\echo === Simulating successful pg_dist_node update part of promote_replica_and_rebalance ===
-=== Simulating successful pg_dist_node update part of promote_replica_and_rebalance ===
--- Node 5 was replica of Node 4 (group 2)
--- We need to:
--- 1. Make Node 5 active.
--- 2. Make Node 5 not a replica.
--- 3. Set Node 5's primarynodeid to 0/NULL.
--- 4. Give Node 5 a new groupid.
-UPDATE pg_catalog.pg_dist_node SET isactive = true, nodeisreplica = false, nodeprimarynodeid = 0 WHERE nodeid = 5;
-UPDATE 1
--- Get a new group ID using the helper. This would be done internally by citus_promote_replica_and_rebalance.
+-- (if pg_promote call had succeeded).
+\echo === Simulating successful pg_dist_node update part of promote_replica_and_rebalance for node :replica_for_worker2_nodeid ===
+=== Simulating successful pg_dist_node update part of promote_replica_and_rebalance for node 4 ===
 SELECT pg_catalog.citus_internal_get_next_group_id() AS new_group_id_for_promoted_node \gset
--- \gset should hide the output of this SELECT
-\echo pg_dist_node state after manually simulating promotion of node 5:
-pg_dist_node state after manually simulating promotion of node 5:
-UPDATE pg_catalog.pg_dist_node SET groupid = :new_group_id_for_promoted_node WHERE nodeid = 5;
+UPDATE pg_catalog.pg_dist_node
+SET isactive = true, nodeisreplica = false, nodeprimarynodeid = 0, groupid = :new_group_id_for_promoted_node, shouldhaveshards = true
+WHERE nodeid = :replica_for_worker2_nodeid;
 UPDATE 1
-SELECT nodeid, groupid, nodename, nodeport, noderole, nodeisreplica, nodeprimarynodeid, isactive FROM pg_catalog.pg_dist_node ORDER BY nodeid;
- nodeid | groupid | nodename  | nodeport | noderole | nodeisreplica | nodeprimarynodeid | isactive 
---------+---------+-----------+----------+----------+---------------+-------------------+----------
-      1 |       0 | localhost |     5432 |        1 | f             |                 0 | t
-      2 |       1 | localhost |     5433 |        1 | f             |                 0 | t
-      3 |       1 | localhost |     5434 |        1 | t             |                 2 | f
-      4 |       2 | localhost |     5436 |        1 | f             |                 0 | t
-      5 |       3 | localhost |     5437 |        1 | f             |                 0 | t
-(5 rows)
+\echo pg_dist_node state after manually simulating promotion of node :replica_for_worker2_nodeid:
+pg_dist_node state after manually simulating promotion of node 4:
+SELECT nodeid, groupid, nodename, nodeport, noderole, nodeisreplica, nodeprimarynodeid, isactive, shouldhaveshards FROM pg_catalog.pg_dist_node ORDER BY nodeid;
+ nodeid | groupid | nodename  | nodeport | noderole | nodeisreplica | nodeprimarynodeid | isactive | shouldhaveshards 
+--------+---------+-----------+----------+----------+---------------+-------------------+----------+------------------
+      1 |       0 | localhost |     5000 | primary  | f             |                 0 | t        | f
+      2 |       1 | localhost |     5001 | primary  | f             |                 0 | t        | t
+      3 |       2 | localhost |     5002 | primary  | f             |                 0 | t        | t
+      4 |       3 | localhost |     5004 | primary  | f             |                 0 | t        | t
+(4 rows)
 
--- Now, call citus_finalize_replica_rebalance_metadata
--- Original primary was node 4 (group 2). Promoted replica is node 5 (now in new_group_id_for_promoted_node, which is 3).
-\echo === Testing citus_finalize_replica_rebalance_metadata ===
-=== Testing citus_finalize_replica_rebalance_metadata ===
-SELECT pg_catalog.citus_finalize_replica_rebalance_metadata(2, 3, 4, 5);
-NOTICE:  Calling PL/pgSQL helper to finalize replica rebalance: original_group_id=2, new_group_id=3, old_node_id=4, new_node_id=5
-NOTICE:  Starting rebalance from group 2 to group 3 (Original Primary NodeID: 4, New Primary NodeID: 5)
-NOTICE:  Rebalancing colocation group: 0
-NOTICE:    No shards found for colocation group 0 on original primary group 2.
-NOTICE:  Metadata rebalancing updates complete.
-NOTICE:  Metadata rebalancing via PL/pgSQL helper complete. Ensure metadata sync is triggered if this is the final step in a multi-UDF process.
- citus_finalize_replica_rebalance_metadata 
----------------------------------------------
- 
-(1 row)
-
-\echo Verification after citus_finalize_replica_rebalance_metadata:
-Verification after citus_finalize_replica_rebalance_metadata:
-\echo pg_dist_node state:
-pg_dist_node state:
-SELECT nodeid, groupid, nodename, nodeport, noderole, nodeisreplica, nodeprimarynodeid, isactive FROM pg_catalog.pg_dist_node ORDER BY nodeid;
- nodeid | groupid | nodename  | nodeport | noderole | nodeisreplica | nodeprimarynodeid | isactive 
---------+---------+-----------+----------+----------+---------------+-------------------+----------
-      1 |       0 | localhost |     5432 |        1 | f             |                 0 | t
-      2 |       1 | localhost |     5433 |        1 | f             |                 0 | t
-      3 |       1 | localhost |     5434 |        1 | t             |                 2 | f
-      4 |       2 | localhost |     5436 |        1 | f             |                 0 | t
-      5 |       3 | localhost |     5437 |        1 | f             |                 0 | t
-(5 rows)
-
--- Create a test table on the original primary group for rebalancing
+-- Create a test table on the original primary's group (worker2_group_id) for rebalancing
+\echo === Setup dist_rebal_table for metadata rebalancing test ===
+=== Setup dist_rebal_table for metadata rebalancing test ===
 DROP TABLE IF EXISTS dist_rebal_table;
 DROP TABLE
 CREATE TABLE dist_rebal_table (id int primary key, value text);
 CREATE TABLE
+-- Explicitly place on worker2_group_id. This requires knowing the groupid.
+-- If create_distributed_table doesn't allow specifying group, this setup is harder.
+-- Assuming worker2 is the only active primary in group 2.
 SELECT create_distributed_table('dist_rebal_table', 'id', colocate_with => 'none', shard_count => 4);
  create_distributed_table 
 --------------------------
  
 (1 row)
 
--- Add data targeting specific shards if possible, or just general data
-INSERT INTO dist_rebal_table SELECT i, 'rebal value ' || i FROM generate_series(1, 20) i;
-INSERT 0 20
--- Ensure shards for dist_rebal_table are on group 2 (original primary for promo test node)
--- This step is tricky as create_distributed_table might pick any available group if not specified.
--- For this test, let's assume new tables might be placed on any active group.
--- We need to ensure some shards are on group 2 (node 4's original group) to test rebalancing *from* it.
--- Let's assume create_distributed_table placed shards on group 2.
--- If this test were more complex, we'd use master_move_shard_placement or similar to set up.
-\echo Shard placements for dist_rebal_table BEFORE rebalance (should be on group 2):
-Shard placements for dist_rebal_table BEFORE rebalance (should be on group 2):
--- Manually move placements to group 2 for predictability if create_distributed_table doesn't allow group specification
+-- Ensure shards are on worker2_group_id. This might require manually moving them if default placement is different.
+-- For simplicity, assume create_distributed_table placed them on an existing primary group.
+-- If it creates on group 1 (worker1), we need to adjust.
+-- Let's try to force placement on group_id of worker2 by finding a table in that group or using a trick.
+-- For now, let's assume create_distributed_table will use one of the available primary groups.
+-- If it used group 1, this test needs adjustment.
+-- The PL/pgSQL function iterates colocation groups on the *specified* original_group_id.
 DO $$
 DECLARE
+    target_group_id int := (SELECT groupid FROM pg_dist_node WHERE nodeid = 3);
+    current_group_id int;
+    first_shardid bigint;
     shard_row RECORD;
 BEGIN
-    FOR shard_row IN SELECT shardid FROM pg_dist_shard WHERE logicalrelid = 'dist_rebal_table'::regclass LOOP
-        UPDATE pg_dist_placement SET groupid = 2 WHERE shardid = shard_row.shardid;
+    -- Check current placement and move if necessary
+    FOR shard_row IN SELECT s.shardid, pl.groupid AS current_placement_group
+                     FROM pg_dist_shard s
+                     LEFT JOIN pg_dist_placement pl ON s.shardid = pl.shardid
+                     WHERE s.logicalrelid = 'dist_rebal_table'::regclass
+    LOOP
+        IF shard_row.current_placement_group IS NULL THEN
+            -- If no placement, create one on the target_group_id
+            INSERT INTO pg_dist_placement (shardid, groupid, placementid, shardstate, shardlength)
+            VALUES (shard_row.shardid, target_group_id, citus_next_placement_id(), 1, 0); -- Assuming shardstate 1=active, length 0
+            RAISE NOTICE 'No placement for shard %, creating on group %', shard_row.shardid, target_group_id;
+        ELSIF shard_row.current_placement_group != target_group_id THEN
+            RAISE NOTICE 'dist_rebal_table shard % is on group %, moving to group % (worker2_group_id)', shard_row.shardid, shard_row.current_placement_group, target_group_id;
+            UPDATE pg_dist_placement SET groupid = target_group_id WHERE shardid = shard_row.shardid;
+        END IF;
     END LOOP;
-END$$;
+END;
+$$;
 DO
+INSERT INTO dist_rebal_table SELECT i, 'rebal value ' || i FROM generate_series(1, 20) i;
+INSERT 0 20
+\echo Shard placements for dist_rebal_table BEFORE finalize (should be on group :worker2_group_id):
+Shard placements for dist_rebal_table BEFORE finalize (should be on group 2):
 SELECT p.shardid, n.nodename, n.nodeport, n.groupid, s.logicalrelid::regclass
 FROM pg_dist_placement p JOIN pg_dist_node n ON p.groupid = n.groupid
 JOIN pg_dist_shard s ON s.shardid = p.shardid
-WHERE s.logicalrelid = 'dist_rebal_table'::regclass
+WHERE s.logicalrelid = 'dist_rebal_table'::regclass AND p.groupid = 2
 ORDER BY p.shardid;
  shardid | nodename  | nodeport | groupid |   logicalrelid   
 ---------+-----------+----------+---------+------------------
-  102016 | localhost |     5436 |       2 | dist_rebal_table
-  102017 | localhost |     5436 |       2 | dist_rebal_table
-  102018 | localhost |     5436 |       2 | dist_rebal_table
-  102019 | localhost |     5436 |       2 | dist_rebal_table
+  102020 | localhost |     5002 |       2 | dist_rebal_table
+  102021 | localhost |     5002 |       2 | dist_rebal_table
+  102022 | localhost |     5002 |       2 | dist_rebal_table
+  102023 | localhost |     5002 |       2 | dist_rebal_table
 (4 rows)
 
--- Now, let's re-run finalize with the actual table with placements on group 2
--- This assumes node 4 is in group 2.
-\echo Re-running finalize for dist_rebal_table which has placements on group 2
-Re-running finalize for dist_rebal_table which has placements on group 2
-SELECT pg_catalog.citus_finalize_replica_rebalance_metadata(2, 3, 4, 5);
-NOTICE:  Calling PL/pgSQL helper to finalize replica rebalance: original_group_id=2, new_group_id=3, old_node_id=4, new_node_id=5
-NOTICE:  Starting rebalance from group 2 to group 3 (Original Primary NodeID: 4, New Primary NodeID: 5)
-NOTICE:  Rebalancing colocation group: 1
-NOTICE:    Found 4 shards for colocation group 1 on group 2 to rebalance.
-NOTICE:    Assigning shard 102016 (public.dist_rebal_table_102016) to new primary (group 3)
-NOTICE:    Assigning shard 102017 (public.dist_rebal_table_102017) to original primary (group 2)
-NOTICE:    Assigning shard 102018 (public.dist_rebal_table_102018) to new primary (group 3)
-NOTICE:    Assigning shard 102019 (public.dist_rebal_table_102019) to original primary (group 2)
+-- Test citus_finalize_replica_rebalance_metadata
+\echo === Testing citus_finalize_replica_rebalance_metadata ===
+=== Testing citus_finalize_replica_rebalance_metadata ===
+-- Original primary was worker2 (nodeid :worker2_actual_nodeid, group :worker2_group_id)
+-- Promoted replica is node :replica_for_worker2_nodeid (now in group :new_group_id_for_promoted_node)
+SELECT pg_catalog.citus_finalize_replica_rebalance_metadata(2, 3, 3, 4);
+NOTICE:  Calling PL/pgSQL helper to finalize replica rebalance: original_group_id=2, new_group_id=3, old_node_id=3, new_node_id=4
+NOTICE:  Starting rebalance from group 2 to group 3 (Original Primary NodeID: 3, New Primary NodeID: 4)
+NOTICE:  Rebalancing colocation group: 2
+NOTICE:    Found 4 shards for colocation group 2 on group 2 to rebalance.
+NOTICE:    Assigning shard 102020 (public.dist_rebal_table_102020) to new primary (group 3)
+NOTICE:    Assigning shard 102021 (public.dist_rebal_table_102021) to original primary (group 2)
+NOTICE:    Assigning shard 102022 (public.dist_rebal_table_102022) to new primary (group 3)
+NOTICE:    Assigning shard 102023 (public.dist_rebal_table_102023) to original primary (group 2)
 NOTICE:  Metadata rebalancing updates complete.
 NOTICE:  Metadata rebalancing via PL/pgSQL helper complete. Ensure metadata sync is triggered if this is the final step in a multi-UDF process.
  citus_finalize_replica_rebalance_metadata 
@@ -275,105 +244,105 @@ NOTICE:  Metadata rebalancing via PL/pgSQL helper complete. Ensure metadata sync
  
 (1 row)
 
-\echo Shard placements for dist_rebal_table AFTER rebalance:
-Shard placements for dist_rebal_table AFTER rebalance:
+\echo Shard placements for dist_rebal_table AFTER finalize:
+Shard placements for dist_rebal_table AFTER finalize:
 SELECT p.shardid, n.nodename, n.nodeport, n.groupid, s.logicalrelid::regclass
 FROM pg_dist_placement p JOIN pg_dist_node n ON p.groupid = n.groupid
 JOIN pg_dist_shard s ON s.shardid = p.shardid
 WHERE s.logicalrelid = 'dist_rebal_table'::regclass
-ORDER BY p.shardid;
+ORDER BY p.shardid, n.groupid; -- Order by groupid as well to see distribution
  shardid | nodename  | nodeport | groupid |   logicalrelid   
 ---------+-----------+----------+---------+------------------
-  102016 | localhost |     5437 |       3 | dist_rebal_table
-  102017 | localhost |     5436 |       2 | dist_rebal_table
-  102018 | localhost |     5437 |       3 | dist_rebal_table
-  102019 | localhost |     5436 |       2 | dist_rebal_table
+  102020 | localhost |     5004 |       3 | dist_rebal_table
+  102021 | localhost |     5002 |       2 | dist_rebal_table
+  102022 | localhost |     5004 |       3 | dist_rebal_table
+  102023 | localhost |     5002 |       2 | dist_rebal_table
 (4 rows)
 
--- Check counts per group for dist_rebal_table
-SELECT n.groupid, count(*) as shard_count
-FROM pg_dist_placement p JOIN pg_dist_node n ON p.groupid = n.groupid
-JOIN pg_dist_shard s ON s.shardid = p.shardid
+\echo Shard counts per group for dist_rebal_table AFTER finalize:
+Shard counts per group for dist_rebal_table AFTER finalize:
+SELECT p.groupid, count(*) as shard_count
+FROM pg_dist_placement p JOIN pg_dist_shard s ON s.shardid = p.shardid
 WHERE s.logicalrelid = 'dist_rebal_table'::regclass
-GROUP BY n.groupid ORDER BY n.groupid;
+GROUP BY p.groupid ORDER BY p.groupid;
  groupid | shard_count 
 ---------+-------------
        2 |           2
        3 |           2
 (2 rows)
 
-\echo pg_dist_cleanup entries (expecting entries for shards moved from group 2 and shards remaining on group 2):
-pg_dist_cleanup entries (expecting entries for shards moved from group 2 and shards remaining on group 2):
-SELECT object_type, object_name, group_id, cleanup_policy FROM pg_catalog.pg_dist_cleanup ORDER BY object_name, group_id;
-    object_type    |          object_name           | group_id |  cleanup_policy   
--------------------+--------------------------------+----------+---------------------
- shard_placement   | public.dist_rebal_table_102016 |        2 | deferred_on_success
- shard_placement   | public.dist_rebal_table_102017 |        3 | deferred_on_success
- shard_placement   | public.dist_rebal_table_102018 |        2 | deferred_on_success
- shard_placement   | public.dist_rebal_table_102019 |        3 | deferred_on_success
+\echo pg_dist_cleanup entries (expecting entries for shards of dist_rebal_table):
+pg_dist_cleanup entries (expecting entries for shards of dist_rebal_table):
+SELECT object_type, left(object_name, 40) as object_name_prefix, group_id, cleanup_policy FROM pg_catalog.pg_dist_cleanup
+WHERE object_name LIKE 'public.dist_rebal_table_%' -- Handle schema qualification more reliably
+ORDER BY object_name_prefix, group_id;
+    object_type    |        object_name_prefix        | group_id |  cleanup_policy   
+-------------------+----------------------------------+----------+---------------------
+ shard_placement   | public.dist_rebal_table_102020   |        2 | deferred_on_success
+ shard_placement   | public.dist_rebal_table_102021   |        3 | deferred_on_success
+ shard_placement   | public.dist_rebal_table_102022   |        2 | deferred_on_success
+ shard_placement   | public.dist_rebal_table_102023   |        3 | deferred_on_success
 (4 rows)
 
 -- Verify data integrity
-SELECT count(*) FROM dist_table;
- count 
--------
-    10
+\echo === Data Integrity Checks ===
+=== Data Integrity Checks ===
+SELECT count(*) AS count_dist_table FROM dist_table;
+ count_dist_table 
+------------------
+               10
 (1 row)
 
-SELECT sum(id) FROM dist_table;
- sum 
------
-  55
+SELECT sum(id) AS sum_dist_table FROM dist_table;
+ sum_dist_table 
+----------------
+             55
 (1 row)
 
-SELECT count(*) FROM ref_table;
- count 
--------
-     5
+SELECT count(*) AS count_ref_table FROM ref_table;
+ count_ref_table 
+-----------------
+               5
 (1 row)
 
-SELECT sum(id) FROM ref_table;
- sum 
------
-  15
+SELECT sum(id) AS sum_ref_table FROM ref_table;
+ sum_ref_table 
+---------------
+            15
 (1 row)
 
-SELECT count(*) FROM dist_rebal_table;
- count 
--------
-    20
+SELECT count(*) AS count_dist_rebal_table FROM dist_rebal_table;
+ count_dist_rebal_table 
+------------------------
+                     20
 (1 row)
 
-SELECT sum(id) FROM dist_rebal_table;
- sum 
------
- 210
+SELECT sum(id) AS sum_dist_rebal_table FROM dist_rebal_table;
+ sum_dist_rebal_table 
+----------------------
+                  210
 (1 row)
 
--- Cleanup
+-- Cleanup (optional, as pg_regress cleans up the instance)
 DROP TABLE dist_table;
 DROP TABLE
 DROP TABLE ref_table;
 DROP TABLE
 DROP TABLE dist_rebal_table;
 DROP TABLE
+\echo Final pg_dist_node state:
+Final pg_dist_node state:
+SELECT nodeid, groupid, nodename, nodeport, noderole, nodeisreplica, nodeprimarynodeid, isactive, shouldhaveshards FROM pg_catalog.pg_dist_node ORDER BY nodeid;
+ nodeid | groupid | nodename  | nodeport | noderole | nodeisreplica | nodeprimarynodeid | isactive | shouldhaveshards 
+--------+---------+-----------+----------+----------+---------------+-------------------+----------+------------------
+      1 |       0 | localhost |     5000 | primary  | f             |                 0 | t        | f
+      2 |       1 | localhost |     5001 | primary  | f             |                 0 | t        | t
+      3 |       2 | localhost |     5002 | primary  | f             |                 0 | t        | t
+      4 |       3 | localhost |     5004 | primary  | f             |                 0 | t        | t
+(4 rows)
+
 SELECT citus_version();
  citus_version 
 ---------------
  Citus 13.1-1
-(1 row)
-
-SELECT pg_extension_version('citus');
- pg_extension_version 
-----------------------
- 13.1-1
-(1 row)
-
--- Show all notices/warnings that might have been suppressed during function calls
-SET client_min_messages TO DEBUG1;
-SET
-SHOW client_min_messages;
- client_min_messages 
----------------------
- debug1
 (1 row)

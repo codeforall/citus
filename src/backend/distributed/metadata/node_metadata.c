@@ -1465,6 +1465,96 @@ citus_add_replica_node(PG_FUNCTION_ARGS)
 							   primaryHostname, primaryPort)));
 	}
 
+	// Verify that the replica is streaming from the primary
+	StringInfoData query_pg_stat_replication;
+	initStringInfo(&query_pg_stat_replication);
+	char *replicaHostnameCStr = replicaHostname; // Already a CString from above
+
+	// Prefer application_name, fallback to client_addr or client_hostname matching replicaHostname
+	// Adding state = 'streaming' for a more precise check.
+	appendStringInfo(&query_pg_stat_replication,
+					 "SELECT count(*) FROM pg_catalog.pg_stat_replication "
+					 "WHERE (application_name = %s OR client_addr::text = %s OR client_hostname = %s) AND state = 'streaming'",
+					 quote_literal_cstr(replicaHostnameCStr),
+					 quote_literal_cstr(replicaHostnameCStr),
+					 quote_literal_cstr(replicaHostnameCStr));
+
+	MultiConnection *primaryConnection = NULL;
+	bool replica_verified = false;
+	int ret;
+
+	PG_TRY();
+	{
+		primaryConnection = GetNodeConnection(CONNECTION_PRIORITY_INVALID,
+											  primaryWorkerNode->workerName,
+											  primaryWorkerNode->workerPort);
+
+		if (primaryConnection == NULL || PQstatus(primaryConnection->pgConn) != CONNECTION_OK)
+		{
+			ereport(ERROR, (errcode(ERRCODE_CONNECTION_FAILURE),
+							errmsg("Could not connect to primary node %s:%d to verify replica status.",
+								   primaryWorkerNode->workerName, primaryWorkerNode->workerPort)));
+		}
+
+		PushActiveSnapshot(GetTransactionSnapshot());
+		SPI_connect();
+		ret = SPI_execute(query_pg_stat_replication.data, true, 0); // read-only, no limit
+
+		if (ret == SPI_OK_SELECT && SPI_processed > 0)
+		{
+			bool isnull;
+			Datum countDatum = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull);
+			if (!isnull)
+			{
+				int64 count = DatumGetInt64(countDatum);
+				if (count > 0) {
+					replica_verified = true;
+				}
+			}
+		}
+		SPI_finish();
+		PopActiveSnapshot();
+
+		if (primaryConnection)
+		{
+			ReleaseNodeConnection(primaryConnection);
+			primaryConnection = NULL;
+		}
+	}
+	PG_CATCH();
+	{
+		if (primaryConnection)
+		{
+			ReleaseNodeConnection(primaryConnection);
+		}
+		pfree(query_pg_stat_replication.data); // pfree data on error
+		FlushErrorState(); // Important before re-throwing or new ereport
+		ereport(ERROR, (errmsg("Error during replica verification on primary node %s:%d: %s",
+							   primaryWorkerNode->workerName, primaryWorkerNode->workerPort, SDL_GetErrMessage(NULL))));
+	}
+	PG_END_TRY();
+
+	pfree(query_pg_stat_replication.data);
+
+	if (!replica_verified)
+	{
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						errmsg("Replica %s:%d does not appear to be a connected and streaming replica of primary %s:%d.",
+							   replicaHostname, replicaPort, // Use CStrings directly
+							   primaryWorkerNode->workerName, primaryWorkerNode->workerPort),
+						errhint("Check pg_stat_replication on the primary node (%s:%d). "
+								"Ensure the replica is connected with state 'streaming', "
+								"and consider setting 'application_name' in the replica's primary_conninfo to its hostname ('%s') for reliable detection.",
+								primaryWorkerNode->workerName, primaryWorkerNode->workerPort, replicaHostname)));
+	}
+	else
+	{
+		ereport(NOTICE, (errmsg("Successfully verified replica %s:%d is streaming from primary %s:%d.",
+							   replicaHostname, replicaPort,
+							   primaryWorkerNode->workerName, primaryWorkerNode->workerPort)));
+	}
+
+
 	WorkerNode *existingReplicaNode = FindWorkerNodeAnyCluster(replicaHostname, replicaPort);
 	if (existingReplicaNode != NULL)
 	{

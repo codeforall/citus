@@ -9,7 +9,7 @@ This approach is useful for minimizing the load of initial data copying on the p
 The high-level workflow involves these stages:
 
 1.  **Manual PostgreSQL Replica Setup:** The database administrator manually sets up a new PostgreSQL instance as a streaming replica of an active Citus worker node. This is done using standard PostgreSQL replication procedures.
-2.  **Register Replica with Citus:** The administrator then registers this PostgreSQL replica with the Citus coordinator using the `citus_add_replica_node` UDF. This makes Citus aware of the replica and its relationship to the primary worker.
+2.  **Register Replica with Citus:** The administrator then registers this PostgreSQL replica with the Citus coordinator using the `citus_add_replica_node` UDF. This function now includes a verification step to confirm the replica is actively streaming from the specified primary.
 3.  **Promote Replica and Update Node Metadata:** The administrator calls the `citus_promote_replica_and_rebalance` UDF. This UDF orchestrates:
     *   Waiting for the replica to synchronize WAL with its primary.
     *   Automatically promoting the PostgreSQL replica to a primary instance using `pg_promote()`.
@@ -22,8 +22,8 @@ The high-level workflow involves these stages:
 *   Successful configuration of PostgreSQL streaming replication from an existing, active Citus worker node (the "primary") to a new PostgreSQL instance (the "replica").
     *   Refer to the official PostgreSQL documentation for setting up streaming replication.
 *   The replica PostgreSQL instance must **not** yet be promoted to a primary when calling `citus_add_replica_node`. It should be a standby server, actively replicating.
-*   **Highly Recommended:** For reliable WAL lag monitoring by `citus_promote_replica_and_rebalance`, configure a unique `application_name` in the replica's `primary_conninfo` setting (in `postgresql.conf` or `standby.signal` / `recovery.conf` depending on your PostgreSQL version). It's good practice for this `application_name` to match the replica's hostname or be otherwise easily identifiable.
-*   The PostgreSQL user connecting to the replica to run `pg_promote()` must have superuser privileges or sufficient permissions to execute `pg_promote()`.
+*   **Highly Recommended for Verification:** For reliable verification by `citus_add_replica_node` and WAL lag monitoring by `citus_promote_replica_and_rebalance`, configure a unique `application_name` in the replica's `primary_conninfo` setting (in `postgresql.conf` or `standby.signal` / `recovery.conf` depending on your PostgreSQL version). It's good practice for this `application_name` to match the replica's hostname or be otherwise easily identifiable.
+*   The PostgreSQL user connecting to the replica to run `pg_promote()` (as part of `citus_promote_replica_and_rebalance`) must have superuser privileges or sufficient permissions to execute `pg_promote()`.
 
 ## New User-Defined Functions (UDFs)
 
@@ -42,7 +42,7 @@ Three UDFs are involved in this process:
     RETURNS INT
     ```
 *   **Description:**
-    Registers a PostgreSQL streaming replica as a potential Citus worker node within the Citus metadata. This function links the replica to its primary Citus worker and records its connection information.
+    Registers a PostgreSQL streaming replica as a potential Citus worker node within the Citus metadata. This function links the replica to its primary Citus worker and records its connection information. It includes a crucial verification step to ensure the replica is actively streaming from the specified primary before registration.
 *   **Arguments:**
     *   `replica_hostname`: The hostname or IP address of the streaming replica instance.
     *   `replica_port`: The port number of the streaming replica instance.
@@ -51,16 +51,19 @@ Three UDFs are involved in this process:
 *   **Return Value:**
     The `nodeid` of the newly registered replica node in `pg_catalog.pg_dist_node`.
 *   **Details:**
+    *   **Replica Verification:** Before registering the replica, `citus_add_replica_node` connects to the specified primary node (`primary_hostname`:`primary_port`) and queries the `pg_catalog.pg_stat_replication` view. It verifies that an entry exists corresponding to the replica (attempting to match by `application_name`, `client_addr`, or `client_hostname` using the provided `replica_hostname`) and that its replication `state` is 'streaming'. If no such active streaming replica entry is found, the function will raise an error, preventing the registration of a node that is not confirmed to be streaming from the specified primary.
     *   The replica is added to the Citus metadata as an inactive node (`isActive=false` and `shouldHaveShards=false` by default).
     *   It is explicitly marked as a replica (`nodeisreplica=true`) and associated with its primary via `nodeprimarynodeid`.
     *   This function must be called **before** the replica is promoted to a primary at the PostgreSQL level.
     *   The replica will typically share the same `groupid`, `noderole`, and `nodecluster` as its primary upon registration.
+*   **Important Note on Verification:** For the most reliable replica verification, ensure the `application_name` in the replica's `primary_conninfo` (e.g., in `postgresql.conf` or the connection string used by the replica) is set to a unique identifier, ideally the `replica_hostname` itself. This allows Citus to accurately find its entry in `pg_stat_replication`.
 *   **Example:**
     ```sql
     -- Assuming 'worker1.example.com:5432' is the primary Citus worker
-    -- and 'replica1.example.com:5432' is its streaming replica.
+    -- and 'replica1.example.com:5432' is its streaming replica,
+    -- with application_name='replica1.example.com' set on the replica.
     SELECT citus_add_replica_node('replica1.example.com', 5432, 'worker1.example.com', 5432);
-    -- Returns the new nodeid for replica1.example.com, e.g., 3
+    -- Returns the new nodeid for replica1.example.com
     ```
 
 ### `citus_promote_replica_and_rebalance` (Now primarily `citus_promote_replica_node_metadata`)
@@ -77,7 +80,7 @@ Three UDFs are involved in this process:
     *   `replica_nodeid`: The `nodeid` (from `pg_catalog.pg_dist_node`) of the replica previously registered with `citus_add_replica_node`.
 *   **Workflow Stages Orchestrated by this UDF:**
     1.  **Blocks Writes:** Temporarily blocks writes to shards on the original primary node.
-    2.  **WAL Sync Wait:** Connects to the original primary node and monitors `pg_stat_replication` to ensure the specified replica has replayed all WAL records and is fully caught up. This step has a timeout (default: 5 minutes).
+    2.  **WAL Sync Wait:** Connects to the original primary node and monitors `pg_stat_replication` to ensure the specified replica has replayed all WAL records and is fully caught up. The UDF attempts to identify the replica using its `application_name` (ideally matching the replica's hostname, as registered) or its client address. This step has a timeout (default: 5 minutes).
     3.  **Automated PostgreSQL Promotion:** Connects to the replica node and executes `SELECT pg_promote(wait := true);` using SPI to promote the replica to a primary instance. The UDF then verifies the promotion by checking `pg_is_in_recovery()` on the replica. This step has a short timeout for verification.
     4.  **Metadata Update:** After successful PostgreSQL promotion, Citus updates the replica's metadata in `pg_catalog.pg_dist_node`: the node is marked as active (`isActive=true`), no longer a replica (`nodeisreplica=false`, `nodeprimarynodeid=0`), is marked as ready to receive shards (`shouldHaveShards=true`), and is assigned a new, unique `groupid` (obtained via `citus_internal_get_next_group_id()`).
 *   **Important Notes:**
@@ -133,8 +136,8 @@ Three UDFs are involved in this process:
 
 ## Example Workflow Summary
 
-1.  **DBA:** Set up a new PostgreSQL instance (`replica-new.example.com:5432`) as a streaming replica of an existing Citus worker (`worker-old.example.com:5432`). Ensure `primary_conninfo` on the replica includes an `application_name`.
-2.  **DBA (on Citus coordinator):** Register the replica:
+1.  **DBA:** Set up a new PostgreSQL instance (`replica-new.example.com:5432`) as a streaming replica of an existing Citus worker (`worker-old.example.com:5432`). Ensure `primary_conninfo` on the replica includes an `application_name` (e.g., `replica-new.example.com`).
+2.  **DBA (on Citus coordinator):** Register the replica with Citus:
     ```sql
     SELECT citus_add_replica_node('replica-new.example.com', 5432, 'worker-old.example.com', 5432) AS replica_nodeid;
     -- Let's say this returns replica_nodeid = 5.
@@ -174,8 +177,8 @@ Three UDFs are involved in this process:
 
 ## Considerations and Limitations
 
-*   **Two-Stage Process:** The promotion and rebalancing is now a two-stage process requiring calls to two UDFs: `citus_promote_replica_and_rebalance` followed by `citus_finalize_replica_rebalance_metadata`. Ensure both are run in the correct order.
-*   **Replica Identification for WAL Sync:** The reliability of detecting the replica in `pg_stat_replication` (for WAL lag checking within `citus_promote_replica_and_rebalance`) is highest when `application_name` is consistently set in the replica's configuration.
+*   **Two-Stage Process:** The promotion and rebalancing is now a two-stage process requiring calls to two UDFs: `citus_promote_replica_and_rebalance` followed by `citus_finalize_replica_rebalance_metadata`. Ensure both are run in the correct order and with correct parameters derived from `pg_dist_node` after the first UDF completes.
+*   **Replica Identification for Verification & WAL Sync:** The reliability of detecting the replica in `pg_stat_replication` (for verification in `citus_add_replica_node` and WAL lag checking within `citus_promote_replica_and_rebalance`) is highest when `application_name` is consistently set in the replica's configuration.
 *   **Permissions for `pg_promote`:** The database user that Citus uses to connect to the replica node (during `citus_promote_replica_and_rebalance`) must have permissions to execute `pg_promote()`. This typically means superuser.
 *   **Atomicity and Failure Recovery:**
     *   Operations on the Citus coordinator are generally transactional.
@@ -185,3 +188,4 @@ Three UDFs are involved in this process:
 *   **Network and Node Availability:** The process relies on network connectivity between the coordinator and both the original primary and replica nodes at various stages.
 *   **Monitoring:** It is crucial to monitor PostgreSQL logs on all involved nodes (coordinator, original primary, replica) and Citus coordinator logs during these operations.
 *   **`pg_dist_cleanup` Table:** The rebalancing process schedules cleanup tasks by inserting into `pg_catalog.pg_dist_cleanup`. Ensure that the Citus maintenance daemon or a similar mechanism is active to process these cleanup records.
+*   **Group ID Assignment:** The `citus_promote_replica_and_rebalance` UDF assigns a new, unique group ID to the promoted replica using an internal mechanism based on the `pg_dist_groupid_seq` sequence.

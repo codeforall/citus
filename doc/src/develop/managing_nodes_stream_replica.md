@@ -15,6 +15,7 @@ The high-level workflow involves these stages:
     *   Automatically promoting the PostgreSQL replica to a primary instance using `pg_promote()`.
     *   Updating the replica's entry in `pg_catalog.pg_dist_node` to mark it as an active, primary Citus worker with a new, unique group ID.
 4.  **Finalize Shard Rebalance:** After the previous step is successful, the administrator calls the `citus_finalize_replica_rebalance_metadata` UDF. This function performs the metadata operations to reassign shard mastership, effectively rebalancing placements between the original primary and the newly promoted node.
+5.  **Remove Unneeded Replica Entries (Optional):** If a replica was registered but will not be promoted, or if a promotion process is abandoned, the `citus_remove_replica_node` UDF can be used to clean up its metadata entry.
 
 ## Prerequisites
 
@@ -27,7 +28,7 @@ The high-level workflow involves these stages:
 
 ## New User-Defined Functions (UDFs)
 
-Three UDFs are involved in this process:
+Four UDFs are involved in this process:
 
 ### `citus_add_replica_node`
 
@@ -134,6 +135,32 @@ Three UDFs are involved in this process:
     );
     ```
 
+### `citus_remove_replica_node`
+
+*   **Syntax:**
+    ```sql
+    citus_remove_replica_node(nodename TEXT, nodeport INT)
+    RETURNS VOID
+    ```
+*   **Description:**
+    Removes an inactive streaming replica node from the Citus cluster metadata. This function is specifically for cleaning up replica entries that were added via `citus_add_replica_node` but have not been promoted, or if a promotion process was abandoned and the replica entry needs to be cleared.
+*   **Arguments:**
+    *   `nodename`: The hostname or IP address of the inactive replica node to be removed.
+    *   `nodeport`: The port number of the inactive replica node to be removed.
+*   **Details & Usage Notes:**
+    *   This function first verifies that the specified node exists in `pg_catalog.pg_dist_node`.
+    *   It then checks if the node is marked as a replica (`nodeisreplica` is true) AND is currently inactive (`isactive` is false).
+    *   If all conditions are met, the node is removed from `pg_dist_node`. These metadata changes are then synchronized across the cluster.
+    *   The function will raise an error if:
+        *   The specified node does not exist.
+        *   The node exists but is not marked as a replica (`nodeisreplica` is false). In this situation, if you intend to remove a primary or other non-replica worker, `citus_remove_node()` should be used.
+        *   The node is marked as a replica but is also active (`isactive` is true). An active replica might indicate it has been promoted or is in an inconsistent state. If it's a promoted, active primary, `citus_remove_node()` would be the appropriate function for removal, after ensuring it has no shard placements or they are moved.
+*   **Example:**
+    ```sql
+    -- Assuming 'replica1.example.com' on port 5432 was previously added as an inactive replica:
+    SELECT pg_catalog.citus_remove_replica_node('replica1.example.com', 5432);
+    ```
+
 ## Example Workflow Summary
 
 1.  **DBA:** Set up a new PostgreSQL instance (`replica-new.example.com:5432`) as a streaming replica of an existing Citus worker (`worker-old.example.com:5432`). Ensure `primary_conninfo` on the replica includes an `application_name` (e.g., `replica-new.example.com`).
@@ -174,10 +201,14 @@ Three UDFs are involved in this process:
     -- This updates pg_dist_placement and schedules cleanups.
     ```
 6.  **Result:** `replica-new.example.com` is now an active Citus worker, sharing load approximately 50/50 (by shard count per colocation group) with `worker-old.example.com`. Data cleanup tasks are scheduled.
+7.  **Cleanup (If Needed):** If an inactive replica entry needs to be removed (e.g., promotion was abandoned):
+    ```sql
+    SELECT citus_remove_replica_node('replica-new.example.com', 5432);
+    ```
 
 ## Considerations and Limitations
 
-*   **Two-Stage Process:** The promotion and rebalancing is now a two-stage process requiring calls to two UDFs: `citus_promote_replica_and_rebalance` followed by `citus_finalize_replica_rebalance_metadata`. Ensure both are run in the correct order and with correct parameters derived from `pg_dist_node` after the first UDF completes.
+*   **Two-Stage Process for Promotion & Rebalance:** The promotion and rebalancing is a two-stage process requiring calls to two UDFs: `citus_promote_replica_and_rebalance` followed by `citus_finalize_replica_rebalance_metadata`. Ensure both are run in the correct order and with correct parameters derived from `pg_dist_node` after the first UDF completes.
 *   **Replica Identification for Verification & WAL Sync:** The reliability of detecting the replica in `pg_stat_replication` (for verification in `citus_add_replica_node` and WAL lag checking within `citus_promote_replica_and_rebalance`) is highest when `application_name` is consistently set in the replica's configuration.
 *   **Permissions for `pg_promote`:** The database user that Citus uses to connect to the replica node (during `citus_promote_replica_and_rebalance`) must have permissions to execute `pg_promote()`. This typically means superuser.
 *   **Atomicity and Failure Recovery:**
@@ -188,4 +219,4 @@ Three UDFs are involved in this process:
 *   **Network and Node Availability:** The process relies on network connectivity between the coordinator and both the original primary and replica nodes at various stages.
 *   **Monitoring:** It is crucial to monitor PostgreSQL logs on all involved nodes (coordinator, original primary, replica) and Citus coordinator logs during these operations.
 *   **`pg_dist_cleanup` Table:** The rebalancing process schedules cleanup tasks by inserting into `pg_catalog.pg_dist_cleanup`. Ensure that the Citus maintenance daemon or a similar mechanism is active to process these cleanup records.
-*   **Group ID Assignment:** The `citus_promote_replica_and_rebalance` UDF assigns a new, unique group ID to the promoted replica using an internal mechanism based on the `pg_dist_groupid_seq` sequence.
+*   **Group ID Assignment:** The `citus_promote_replica_and_rebalance` UDF assigns a new, unique group ID to the promoted replica using an internal mechanism based on the `pg_dist_groupid_seq` sequence, called via the `citus_internal_get_next_group_id()` SQL helper.

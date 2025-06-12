@@ -169,6 +169,7 @@ PG_FUNCTION_INFO_V1(citus_is_coordinator);
 PG_FUNCTION_INFO_V1(citus_internal_mark_node_not_synced);
 PG_FUNCTION_INFO_V1(citus_is_primary_node);
 PG_FUNCTION_INFO_V1(citus_add_replica_node);
+PG_FUNCTION_INFO_V1(citus_remove_replica_node);
 
 /*
  * DefaultNodeMetadata creates a NodeMetadata struct with the fields set to
@@ -1647,6 +1648,61 @@ citus_add_replica_node(PG_FUNCTION_ARGS)
 	 */
 
 	PG_RETURN_INT32(replicaNodeId);
+}
+
+
+/*
+ * citus_remove_replica_node removes an inactive streaming replica node from Citus metadata.
+ */
+Datum
+citus_remove_replica_node(PG_FUNCTION_ARGS)
+{
+	CheckCitusVersion(ERROR);
+	EnsureSuperUser();
+	EnsureCoordinator();
+
+	text *nodeNameText = PG_GETARG_TEXT_P(0);
+	int32 nodePort = PG_GETARG_INT32(1);
+	char *nodeName = text_to_cstring(nodeNameText);
+
+	WorkerNode *workerNode = FindWorkerNodeAnyCluster(nodeName, nodePort);
+
+	if (workerNode == NULL)
+	{
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						errmsg("node \"%s:%d\" does not exist", nodeName, nodePort)));
+	}
+
+	if (!workerNode->nodeisreplica)
+	{
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						errmsg("Node %s:%d (ID %d) is not a replica node. "
+							   "Use citus_remove_node() to remove primary or already promoted nodes.",
+							   workerNode->workerName, workerNode->workerPort, workerNode->nodeId)));
+	}
+
+	if (workerNode->isActive)
+	{
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						errmsg("Replica node %s:%d (ID %d) is marked as active and cannot be removed with this function. "
+							   "This might indicate a promoted replica. Consider using citus_remove_node() if you are sure, "
+							   "or ensure it's properly deactivated if it's an unpromoted replica in an unexpected state.",
+							   workerNode->workerName, workerNode->workerPort, workerNode->nodeId)));
+	}
+
+	/*
+	 * All checks passed, proceed with removal.
+	 * RemoveNodeFromCluster handles locking, catalog changes, connection closing, and metadata sync.
+	 */
+	ereport(NOTICE, (errmsg("Removing inactive replica node %s:%d (ID %d)",
+						   workerNode->workerName, workerNode->workerPort, workerNode->nodeId)));
+
+	RemoveNodeFromCluster(workerNode->workerName, workerNode->workerPort);
+
+	/* RemoveNodeFromCluster might set this, but setting it here ensures it's marked for this UDF's transaction. */
+	TransactionModifiedNodeMetadata = true;
+
+	PG_RETURN_VOID();
 }
 
 

@@ -162,9 +162,56 @@ SELECT count(*) AS count_dist_rebal_table FROM dist_rebal_table;
 SELECT sum(id) AS sum_dist_rebal_table FROM dist_rebal_table;
 
 -- Cleanup (optional, as pg_regress cleans up the instance)
-DROP TABLE dist_table;
-DROP TABLE ref_table;
-DROP TABLE dist_rebal_table;
+DROP TABLE IF EXISTS dist_table;
+DROP TABLE IF EXISTS ref_table;
+DROP TABLE IF EXISTS dist_rebal_table;
+
+
+-- Test citus_remove_replica_node
+\echo === Testing citus_remove_replica_node ===
+
+-- Add a new primary node for these tests
+SELECT citus_add_node('localhost', पीजी_REGRESS_FUNCS_PORT_WORKER_3, groupid => 4, noderole => 'primary') AS worker3_node_id \gset
+SELECT pg_catalog.pg_dist_node.nodeid AS worker3_actual_nodeid FROM pg_catalog.pg_dist_node WHERE nodename = 'localhost' AND nodeport = पीजी_REGRESS_FUNCS_PORT_WORKER_3 \gset
+SELECT pg_catalog.pg_dist_node.groupid AS worker3_group_id FROM pg_catalog.pg_dist_node WHERE nodeid = :worker3_actual_nodeid \gset
+
+
+-- Manually insert an inactive replica for worker3 to test successful removal
+\echo Manually inserting an inactive replica for worker3 (nodeid :worker3_actual_nodeid) to test removal
+INSERT INTO pg_catalog.pg_dist_node (nodename, nodeport, groupid, noderole, nodeisreplica, nodeprimarynodeid, isactive, shouldhaveshards, nodecluster)
+VALUES ('localhost', पीजी_REGRESS_FUNCS_PORT_REPLICA_3, :worker3_group_id, 'primary', true, :worker3_actual_nodeid, false, false, 'default')
+RETURNING nodeid AS replica_for_worker3_to_remove_nodeid \gset
+
+-- Manually insert an *active* replica for worker3 for error testing removal
+\echo Manually inserting an *active* replica for worker3 for error testing removal
+INSERT INTO pg_catalog.pg_dist_node (nodename, nodeport, groupid, noderole, nodeisreplica, nodeprimarynodeid, isactive, shouldhaveshards, nodecluster)
+VALUES ('localhost', पीजी_REGRESS_FUNCS_PORT_REPLICA_4, :worker3_group_id, 'primary', true, :worker3_actual_nodeid, true, true, 'default')
+RETURNING nodeid AS active_replica_for_error_test_nodeid \gset
+
+\echo pg_dist_node state before remove tests:
+SELECT nodeid, nodename, nodeport, groupid, isactive, nodeisreplica, nodeprimarynodeid FROM pg_catalog.pg_dist_node ORDER BY nodeid;
+
+-- Success Case: Remove the inactive replica
+\echo Attempting to remove inactive replica (localhost: पीजी_REGRESS_FUNCS_PORT_REPLICA_3, nodeid :replica_for_worker3_to_remove_nodeid) - EXPECTED TO SUCCEED
+SELECT pg_catalog.citus_remove_replica_node('localhost', पीजी_REGRESS_FUNCS_PORT_REPLICA_3);
+\echo Verify replica (localhost: पीजी_REGRESS_FUNCS_PORT_REPLICA_3) is removed:
+SELECT nodeid, nodename, nodeport FROM pg_catalog.pg_dist_node WHERE nodename = 'localhost' AND nodeport = पीजी_REGRESS_FUNCS_PORT_REPLICA_3; -- Should be empty
+
+-- Error Case: Node does not exist
+\echo Attempting to remove a non-existent replica - EXPECTED TO FAIL
+SELECT pg_catalog.citus_remove_replica_node('nonexistent_host', 1234);
+
+-- Error Case: Node is not a replica (target worker1 :worker1_actual_nodeid)
+\echo Attempting to remove a primary node (worker1 at localhost: पीजी_REGRESS_FUNCS_PORT_WORKER_1) using citus_remove_replica_node - EXPECTED TO FAIL
+SELECT pg_catalog.citus_remove_replica_node('localhost', पीजी_REGRESS_FUNCS_PORT_WORKER_1);
+
+-- Error Case: Node is a replica but is active (target active_replica_for_error_test_nodeid)
+\echo Attempting to remove an *active* replica (localhost: पीजी_REGRESS_FUNCS_PORT_REPLICA_4, nodeid :active_replica_for_error_test_nodeid) - EXPECTED TO FAIL
+SELECT pg_catalog.citus_remove_replica_node('localhost', पीजी_REGRESS_FUNCS_PORT_REPLICA_4);
+
+\echo pg_dist_node state after remove tests (active replica should still be there, worker3 and its inactive replica removed):
+SELECT nodeid, nodename, nodeport, groupid, isactive, nodeisreplica, nodeprimarynodeid FROM pg_catalog.pg_dist_node ORDER BY nodeid;
+
 
 \echo Final pg_dist_node state:
 SELECT nodeid, groupid, nodename, nodeport, noderole, nodeisreplica, nodeprimarynodeid, isactive, shouldhaveshards FROM pg_catalog.pg_dist_node ORDER BY nodeid;

@@ -205,6 +205,10 @@ BEGIN
     END LOOP;
 END;
 $$;
+NOTICE:  No placement for shard 102024, creating on group 2
+NOTICE:  No placement for shard 102025, creating on group 2
+NOTICE:  No placement for shard 102026, creating on group 2
+NOTICE:  No placement for shard 102027, creating on group 2
 DO
 INSERT INTO dist_rebal_table SELECT i, 'rebal value ' || i FROM generate_series(1, 20) i;
 INSERT 0 20
@@ -217,10 +221,10 @@ WHERE s.logicalrelid = 'dist_rebal_table'::regclass AND p.groupid = 2
 ORDER BY p.shardid;
  shardid | nodename  | nodeport | groupid |   logicalrelid   
 ---------+-----------+----------+---------+------------------
-  102020 | localhost |     5002 |       2 | dist_rebal_table
-  102021 | localhost |     5002 |       2 | dist_rebal_table
-  102022 | localhost |     5002 |       2 | dist_rebal_table
-  102023 | localhost |     5002 |       2 | dist_rebal_table
+  102024 | localhost |     5002 |       2 | dist_rebal_table
+  102025 | localhost |     5002 |       2 | dist_rebal_table
+  102026 | localhost |     5002 |       2 | dist_rebal_table
+  102027 | localhost |     5002 |       2 | dist_rebal_table
 (4 rows)
 
 -- Test citus_finalize_replica_rebalance_metadata
@@ -231,12 +235,12 @@ ORDER BY p.shardid;
 SELECT pg_catalog.citus_finalize_replica_rebalance_metadata(2, 3, 3, 4);
 NOTICE:  Calling PL/pgSQL helper to finalize replica rebalance: original_group_id=2, new_group_id=3, old_node_id=3, new_node_id=4
 NOTICE:  Starting rebalance from group 2 to group 3 (Original Primary NodeID: 3, New Primary NodeID: 4)
-NOTICE:  Rebalancing colocation group: 2
-NOTICE:    Found 4 shards for colocation group 2 on group 2 to rebalance.
-NOTICE:    Assigning shard 102020 (public.dist_rebal_table_102020) to new primary (group 3)
-NOTICE:    Assigning shard 102021 (public.dist_rebal_table_102021) to original primary (group 2)
-NOTICE:    Assigning shard 102022 (public.dist_rebal_table_102022) to new primary (group 3)
-NOTICE:    Assigning shard 102023 (public.dist_rebal_table_102023) to original primary (group 2)
+NOTICE:  Rebalancing colocation group: 3
+NOTICE:    Found 4 shards for colocation group 3 on group 2 to rebalance.
+NOTICE:    Assigning shard 102024 (public.dist_rebal_table_102024) to new primary (group 3)
+NOTICE:    Assigning shard 102025 (public.dist_rebal_table_102025) to original primary (group 2)
+NOTICE:    Assigning shard 102026 (public.dist_rebal_table_102026) to new primary (group 3)
+NOTICE:    Assigning shard 102027 (public.dist_rebal_table_102027) to original primary (group 2)
 NOTICE:  Metadata rebalancing updates complete.
 NOTICE:  Metadata rebalancing via PL/pgSQL helper complete. Ensure metadata sync is triggered if this is the final step in a multi-UDF process.
  citus_finalize_replica_rebalance_metadata 
@@ -253,10 +257,10 @@ WHERE s.logicalrelid = 'dist_rebal_table'::regclass
 ORDER BY p.shardid, n.groupid; -- Order by groupid as well to see distribution
  shardid | nodename  | nodeport | groupid |   logicalrelid   
 ---------+-----------+----------+---------+------------------
-  102020 | localhost |     5004 |       3 | dist_rebal_table
-  102021 | localhost |     5002 |       2 | dist_rebal_table
-  102022 | localhost |     5004 |       3 | dist_rebal_table
-  102023 | localhost |     5002 |       2 | dist_rebal_table
+  102024 | localhost |     5004 |       3 | dist_rebal_table
+  102025 | localhost |     5002 |       2 | dist_rebal_table
+  102026 | localhost |     5004 |       3 | dist_rebal_table
+  102027 | localhost |     5002 |       2 | dist_rebal_table
 (4 rows)
 
 \echo Shard counts per group for dist_rebal_table AFTER finalize:
@@ -278,10 +282,10 @@ WHERE object_name LIKE 'public.dist_rebal_table_%' -- Handle schema qualificatio
 ORDER BY object_name_prefix, group_id;
     object_type    |        object_name_prefix        | group_id |  cleanup_policy   
 -------------------+----------------------------------+----------+---------------------
- shard_placement   | public.dist_rebal_table_102020   |        2 | deferred_on_success
- shard_placement   | public.dist_rebal_table_102021   |        3 | deferred_on_success
- shard_placement   | public.dist_rebal_table_102022   |        2 | deferred_on_success
- shard_placement   | public.dist_rebal_table_102023   |        3 | deferred_on_success
+ shard_placement   | public.dist_rebal_table_102024   |        2 | deferred_on_success
+ shard_placement   | public.dist_rebal_table_102025   |        3 | deferred_on_success
+ shard_placement   | public.dist_rebal_table_102026   |        2 | deferred_on_success
+ shard_placement   | public.dist_rebal_table_102027   |        3 | deferred_on_success
 (4 rows)
 
 -- Verify data integrity
@@ -324,12 +328,108 @@ SELECT sum(id) AS sum_dist_rebal_table FROM dist_rebal_table;
 (1 row)
 
 -- Cleanup (optional, as pg_regress cleans up the instance)
-DROP TABLE dist_table;
+DROP TABLE IF EXISTS dist_table;
 DROP TABLE
-DROP TABLE ref_table;
+DROP TABLE IF EXISTS ref_table;
 DROP TABLE
-DROP TABLE dist_rebal_table;
+DROP TABLE IF EXISTS dist_rebal_table;
 DROP TABLE
+-- Test citus_remove_replica_node
+\echo === Testing citus_remove_replica_node ===
+=== Testing citus_remove_replica_node ===
+-- Add a new primary node for these tests
+SELECT citus_add_node('localhost', पीजी_REGRESS_FUNCS_PORT_WORKER_3, groupid => 4, noderole => 'primary') AS worker3_node_id \gset
+ worker3_node_id 
+-----------------
+               5
+SELECT pg_catalog.pg_dist_node.nodeid AS worker3_actual_nodeid FROM pg_catalog.pg_dist_node WHERE nodename = 'localhost' AND nodeport = पीजी_REGRESS_FUNCS_PORT_WORKER_3 \gset
+ worker3_actual_nodeid 
+-----------------------
+                     5
+SELECT pg_catalog.pg_dist_node.groupid AS worker3_group_id FROM pg_catalog.pg_dist_node WHERE nodeid = :worker3_actual_nodeid \gset
+ worker3_group_id 
+------------------
+                4
+-- Manually insert an inactive replica for worker3 to test successful removal
+\echo Manually inserting an inactive replica for worker3 (nodeid :worker3_actual_nodeid) to test removal
+Manually inserting an inactive replica for worker3 (nodeid 5) to test removal
+INSERT INTO pg_catalog.pg_dist_node (nodename, nodeport, groupid, noderole, nodeisreplica, nodeprimarynodeid, isactive, shouldhaveshards, nodecluster)
+VALUES ('localhost', पीजी_REGRESS_FUNCS_PORT_REPLICA_3, :worker3_group_id, 'primary', true, :worker3_actual_nodeid, false, false, 'default')
+RETURNING nodeid AS replica_for_worker3_to_remove_nodeid \gset
+ replica_for_worker3_to_remove_nodeid 
+--------------------------------------
+                                    6
+-- Manually insert an *active* replica for worker3 for error testing removal
+\echo Manually inserting an *active* replica for worker3 for error testing removal
+Manually inserting an *active* replica for worker3 for error testing removal
+INSERT INTO pg_catalog.pg_dist_node (nodename, nodeport, groupid, noderole, nodeisreplica, nodeprimarynodeid, isactive, shouldhaveshards, nodecluster)
+VALUES ('localhost', पीजी_REGRESS_FUNCS_PORT_REPLICA_4, :worker3_group_id, 'primary', true, :worker3_actual_nodeid, true, true, 'default')
+RETURNING nodeid AS active_replica_for_error_test_nodeid \gset
+ active_replica_for_error_test_nodeid 
+--------------------------------------
+                                    7
+\echo pg_dist_node state before remove tests:
+pg_dist_node state before remove tests:
+SELECT nodeid, nodename, nodeport, groupid, isactive, nodeisreplica, nodeprimarynodeid FROM pg_catalog.pg_dist_node ORDER BY nodeid;
+ nodeid | nodename  | nodeport | groupid | isactive | nodeisreplica | nodeprimarynodeid 
+--------+-----------+----------+---------+----------+---------------+-------------------
+      1 | localhost |     5000 |       0 | t        | f             |                 0
+      2 | localhost |     5001 |       1 | t        | f             |                 0
+      3 | localhost |     5002 |       2 | t        | f             |                 0
+      4 | localhost |     5004 |       3 | t        | f             |                 0
+      5 | localhost |     5005 |       4 | t        | f             |                 0
+      6 | localhost |     5003 |       4 | f        | t             |                 5
+      7 | localhost |     5006 |       4 | t        | t             |                 5
+(7 rows)
+
+-- Success Case: Remove the inactive replica
+\echo Attempting to remove inactive replica (localhost: पीजी_REGRESS_FUNCS_PORT_REPLICA_3, nodeid :replica_for_worker3_to_remove_nodeid) - EXPECTED TO SUCCEED
+Attempting to remove inactive replica (localhost: 5003, nodeid 6) - EXPECTED TO SUCCEED
+SELECT pg_catalog.citus_remove_replica_node('localhost', पीजी_REGRESS_FUNCS_PORT_REPLICA_3);
+NOTICE:  Removing inactive replica node localhost:5003 (ID 6)
+ citus_remove_replica_node 
+---------------------------
+ 
+(1 row)
+
+\echo Verify replica (localhost: पीजी_REGRESS_FUNCS_PORT_REPLICA_3) is removed:
+Verify replica (localhost: 5003) is removed:
+SELECT nodeid, nodename, nodeport FROM pg_catalog.pg_dist_node WHERE nodename = 'localhost' AND nodeport = पीजी_REGRESS_FUNCS_PORT_REPLICA_3; -- Should be empty
+ nodeid | nodename | nodeport 
+--------+----------+----------
+(0 rows)
+
+-- Error Case: Node does not exist
+\echo Attempting to remove a non-existent replica - EXPECTED TO FAIL
+Attempting to remove a non-existent replica - EXPECTED TO FAIL
+SELECT pg_catalog.citus_remove_replica_node('nonexistent_host', 1234);
+ERROR:  node "nonexistent_host:1234" does not exist
+CONTEXT:  SQL function "citus_remove_replica_node" statement 1
+-- Error Case: Node is not a replica (target worker1 :worker1_actual_nodeid)
+\echo Attempting to remove a primary node (worker1 at localhost: पीजी_REGRESS_FUNCS_PORT_WORKER_1) using citus_remove_replica_node - EXPECTED TO FAIL
+Attempting to remove a primary node (worker1 at localhost: 5001) using citus_remove_replica_node - EXPECTED TO FAIL
+SELECT pg_catalog.citus_remove_replica_node('localhost', पीजी_REGRESS_FUNCS_PORT_WORKER_1);
+ERROR:  Node localhost:5001 (ID 2) is not a replica node. Use citus_remove_node() to remove primary or already promoted nodes.
+CONTEXT:  SQL function "citus_remove_replica_node" statement 1
+-- Error Case: Node is a replica but is active (target active_replica_for_error_test_nodeid)
+\echo Attempting to remove an *active* replica (localhost: पीजी_REGRESS_FUNCS_PORT_REPLICA_4, nodeid :active_replica_for_error_test_nodeid) - EXPECTED TO FAIL
+Attempting to remove an *active* replica (localhost: 5006, nodeid 7) - EXPECTED TO FAIL
+SELECT pg_catalog.citus_remove_replica_node('localhost', पीजी_REGRESS_FUNCS_PORT_REPLICA_4);
+ERROR:  Replica node localhost:5006 (ID 7) is marked as active and cannot be removed with this function. This might indicate a promoted replica. Consider using citus_remove_node() if you are sure, or ensure it's properly deactivated if it's an unpromoted replica in an unexpected state.
+CONTEXT:  SQL function "citus_remove_replica_node" statement 1
+\echo pg_dist_node state after remove tests (active replica should still be there, worker3 and its inactive replica removed):
+pg_dist_node state after remove tests (active replica should still be there, worker3 and its inactive replica removed):
+SELECT nodeid, nodename, nodeport, groupid, isactive, nodeisreplica, nodeprimarynodeid FROM pg_catalog.pg_dist_node ORDER BY nodeid;
+ nodeid | nodename  | nodeport | groupid | isactive | nodeisreplica | nodeprimarynodeid 
+--------+-----------+----------+---------+----------+---------------+-------------------
+      1 | localhost |     5000 |       0 | t        | f             |                 0
+      2 | localhost |     5001 |       1 | t        | f             |                 0
+      3 | localhost |     5002 |       2 | t        | f             |                 0
+      4 | localhost |     5004 |       3 | t        | f             |                 0
+      5 | localhost |     5005 |       4 | t        | f             |                 0
+      7 | localhost |     5006 |       4 | t        | t             |                 5
+(6 rows)
+
 \echo Final pg_dist_node state:
 Final pg_dist_node state:
 SELECT nodeid, groupid, nodename, nodeport, noderole, nodeisreplica, nodeprimarynodeid, isactive, shouldhaveshards FROM pg_catalog.pg_dist_node ORDER BY nodeid;
@@ -339,7 +439,9 @@ SELECT nodeid, groupid, nodename, nodeport, noderole, nodeisreplica, nodeprimary
       2 |       1 | localhost |     5001 | primary  | f             |                 0 | t        | t
       3 |       2 | localhost |     5002 | primary  | f             |                 0 | t        | t
       4 |       3 | localhost |     5004 | primary  | f             |                 0 | t        | t
-(4 rows)
+      5 |       4 | localhost |     5005 | primary  | f             |                 0 | t        | t
+      7 |       4 | localhost |     5006 | primary  | t             |                 5 | t        | t
+(6 rows)
 
 SELECT citus_version();
  citus_version 

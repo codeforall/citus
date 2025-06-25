@@ -31,7 +31,8 @@ CREATE OR REPLACE FUNCTION pg_catalog.get_rebalance_plan_for_two_nodes(
                    sourcename text,
                    sourceport int,
                    targetname text,
-                   targetport int)
+                   targetport int,
+                   action text) -- New column
     AS 'MODULE_PATHNAME'
     LANGUAGE C VOLATILE;
 
@@ -39,4 +40,4 @@ COMMENT ON FUNCTION pg_catalog.get_rebalance_table_shards_plan(regclass, float4,
     IS 'returns the list of shard placement moves to be done on a rebalance operation';
 
 COMMENT ON FUNCTION pg_catalog.get_rebalance_plan_for_two_nodes(text, int, text, int, regclass, bigint[], name)
-    IS 'shows the shard movements to balance shards between two specified worker nodes';
+    IS 'shows all shards on the source node and indicates if they should MOVE or STAY to balance with the target node';

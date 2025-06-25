@@ -3704,83 +3704,161 @@ get_rebalance_plan_for_two_nodes(PG_FUNCTION_ARGS)
 			 * considered for this specific two-node balancing plan's shard distribution.
 			 * We calculate costs based *only* on the shards currently on the source node.
 			 */
-			float4 totalCostOfSourceShards = sourceFillState->totalCost;
-			float4 targetCostGoal = totalCostOfSourceShards / 2.0;
-			float4 currentTargetCostContribution = 0; /* Cost moved to target in this plan */
+			/*
+			 * The core idea is to simulate the balancing process between these two nodes.
+			 * We have all shards on sourceFillState. TargetFillState is initially empty (in terms of these specific shards).
+			 * We want to move shards from source to target until their costs are as balanced as possible.
+			 */
+			float4 sourceCurrentCost = sourceFillState->totalCost;
+			float4 targetCurrentCost = 0; /* Representing cost on target from these source shards */
 
-			/* Sort shards on source node by cost (descending) to prioritize larger shards or apply some strategy */
+			/* Sort shards on source node by cost (descending). This is a common heuristic. */
 			sourceFillState->shardCostListDesc = SortList(sourceFillState->shardCostListDesc, CompareShardCostDesc);
 
-			ShardCost *shardCostToConsider = NULL;
-			foreach_declared_ptr(shardCostToConsider, sourceFillState->shardCostListDesc)
-			{
-				/*
-				 * Decide if this shard should move.
-				 * If target's accumulated cost is less than half the total, move this shard.
-				 */
-				if (currentTargetCostContribution < targetCostGoal)
-				{
-					/*
-					 * Ensure the shard is allowed on the target node.
-					 * For a truly empty target, this should generally be true unless
-					 * there are specific shard-node constraints defined by shardAllowedOnNodeUDF.
-					 */
-					if (state->functions->shardAllowedOnNode(shardCostToConsider->shardId,
-															 targetNode,
-															 state->functions->context))
-					{
-						PlacementUpdateEvent *update = palloc0(sizeof(PlacementUpdateEvent));
-						update->shardId = shardCostToConsider->shardId;
-						update->sourceNode = sourceNode; /* Actual source node */
-						update->targetNode = targetNode; /* Actual target node */
-						update->updateType = PLACEMENT_UPDATE_MOVE;
-						placementUpdateList = lappend(placementUpdateList, update);
+			List *potentialMoves = NIL;
+			ListCell *lc_shardcost = NULL;
 
-						currentTargetCostContribution += shardCostToConsider->cost;
-					}
-				}
-				else
+			/*
+			 * Iterate through each shard on the source node. For each shard, decide if moving it
+			 * to the target node would improve the balance (or is necessary to reach balance).
+			 * A simple greedy approach: move shard if target node's current cost is less than source's.
+			 */
+			foreach(lc_shardcost, sourceFillState->shardCostListDesc)
+			{
+				ShardCost *shardToConsider = (ShardCost *) lfirst(lc_shardcost);
+
+				/* Check if shard is allowed on the target node */
+				if (!state->functions->shardAllowedOnNode(shardToConsider->shardId,
+														  targetNode,
+														  state->functions->context))
 				{
-					/* Target has received its intended share of the load from the source node */
-					break;
+					continue; /* Cannot move this shard to the target */
+				}
+
+				/*
+				 * If moving this shard makes the target less loaded than the source would become,
+				 * or if target is simply less loaded currently, consider the move.
+				 * More accurately, we move if target's cost + shard's cost < source's cost - shard's cost (approximately)
+				 * or if target is significantly emptier.
+				 * The condition (targetCurrentCost < sourceCurrentCost - shardToConsider->cost) is a greedy choice.
+				 * A better check: would moving this shard reduce the difference in costs?
+				 * Current difference: abs(sourceCurrentCost - targetCurrentCost)
+				 * Difference after move: abs((sourceCurrentCost - shardToConsider->cost) - (targetCurrentCost + shardToConsider->cost))
+				 * Move if new difference is smaller.
+				 */
+				float4 costOfShard = shardToConsider->cost;
+				float4 diffBefore = fabsf(sourceCurrentCost - targetCurrentCost);
+				float4 diffAfter = fabsf((sourceCurrentCost - costOfShard) - (targetCurrentCost + costOfShard));
+
+				if (diffAfter < diffBefore)
+				{
+					PlacementUpdateEvent *update = palloc0(sizeof(PlacementUpdateEvent));
+					update->shardId = shardToConsider->shardId;
+					update->sourceNode = sourceNode;
+					update->targetNode = targetNode;
+					update->updateType = PLACEMENT_UPDATE_MOVE;
+					potentialMoves = lappend(potentialMoves, update);
+
+					/* Update simulated costs for the next iteration */
+					sourceCurrentCost -= costOfShard;
+					targetCurrentCost += costOfShard;
 				}
 			}
+			placementUpdateList = potentialMoves;
 		}
-		/*
-		 * Note: We don't call hash_destroy(state->placementsHash) or free 'state' itself here
-		 * as it's typically handled by memory contexts in PostgreSQL.
-		 * The RebalanceState was initialized in the current memory context.
-		 */
+		/* RebalanceState is in memory context, will be cleaned up */
 	}
 
-	TupleDesc tupdesc;
-	Tuplestorestate *tupstore = SetupTuplestore(fcinfo, &tupdesc);
+	/*
+	 * The current placementUpdateList contains only shards that should MOVE.
+	 * For the new requirement, we need to list all shards from allSourcePlacements
+	 * and mark them as MOVE or STAY.
+	 */
+	List *finalOutputList = NIL;
+	ListCell *lc_all_source_shards = NULL;
 
-	ListCell *colocatedUpdateCell = NULL;
-	foreach(colocatedUpdateCell, placementUpdateList)
+	foreach(lc_all_source_shards, allSourcePlacements)
 	{
-		PlacementUpdateEvent *colocatedUpdate = lfirst(colocatedUpdateCell);
-		Datum values[7];
-		bool nulls[7];
+		ShardPlacement *sourcePlacement = (ShardPlacement *) lfirst(lc_all_source_shards);
+		bool foundInMoves = false;
+		PlacementUpdateEvent *moveEvent = NULL;
+
+		ListCell *lc_move = NULL;
+		foreach(lc_move, placementUpdateList)
+		{
+			PlacementUpdateEvent *currentMove = (PlacementUpdateEvent *) lfirst(lc_move);
+			if (currentMove->shardId == sourcePlacement->shardId)
+			{
+				foundInMoves = true;
+				moveEvent = currentMove;
+				break;
+			}
+		}
+
+		TuplestoreStructure *outputRow = palloc0(sizeof(TuplestoreStructure));
+		outputRow->tableName = RelationIdForShard(sourcePlacement->shardId);
+		outputRow->shardId = sourcePlacement->shardId;
+		outputRow->shardSize = ShardLength(sourcePlacement->shardId); /* Or use GetShardCost if more appropriate */
+		outputRow->sourceName = sourcePlacement->nodeName;
+		outputRow->sourcePort = sourcePlacement->nodePort;
+
+		if (foundInMoves)
+		{
+			outputRow->targetName = moveEvent->targetNode->workerName;
+			outputRow->targetPort = moveEvent->targetNode->workerPort;
+			outputRow->action = "MOVE";
+		}
+		else
+		{
+			outputRow->targetName = sourcePlacement->nodeName;
+			outputRow->targetPort = sourcePlacement->nodePort;
+			outputRow->action = "STAY";
+		}
+		finalOutputList = lappend(finalOutputList, outputRow);
+	}
+
+
+	TupleDesc tupdesc;
+	Tuplestorestate *tupstore = SetupTuplestore(fcinfo, &tupdesc); /* This will need adjustment for new structure */
+
+	ListCell *outputCell = NULL;
+	foreach(outputCell, finalOutputList)
+	{
+		TuplestoreStructureTwoNode *row = (TuplestoreStructureTwoNode *) lfirst(outputCell);
+		Datum values[8]; /* Increased for the new action column */
+		bool nulls[8];
 
 		memset(values, 0, sizeof(values));
 		memset(nulls, 0, sizeof(nulls));
 
-		values[0] = ObjectIdGetDatum(RelationIdForShard(colocatedUpdate->shardId));
-		values[1] = UInt64GetDatum(colocatedUpdate->shardId);
-		values[2] = UInt64GetDatum(ShardLength(colocatedUpdate->shardId));
-		values[3] = PointerGetDatum(cstring_to_text(
-										colocatedUpdate->sourceNode->workerName));
-		values[4] = UInt32GetDatum(colocatedUpdate->sourceNode->workerPort);
-		values[5] = PointerGetDatum(cstring_to_text(
-										colocatedUpdate->targetNode->workerName));
-		values[6] = UInt32GetDatum(colocatedUpdate->targetNode->workerPort);
+		values[0] = ObjectIdGetDatum(row->tableName);
+		values[1] = UInt64GetDatum(row->shardId);
+		values[2] = UInt64GetDatum(row->shardSize);
+		values[3] = PointerGetDatum(cstring_to_text(row->sourceName));
+		values[4] = Int32GetDatum(row->sourcePort);
+		values[5] = PointerGetDatum(cstring_to_text(row->targetName));
+		values[6] = Int32GetDatum(row->targetPort);
+		values[7] = PointerGetDatum(cstring_to_text(row->action));
 
 		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
 	}
 
 	return (Datum) 0;
 }
+
+
+/* Helper struct for get_rebalance_plan_for_two_nodes output */
+typedef struct TuplestoreStructureTwoNode
+{
+	Oid tableName;
+	uint64 shardId;
+	uint64 shardSize;
+	char *sourceName;
+	int32 sourcePort;
+	char *targetName;
+	int32 targetPort;
+	char *action; /* "MOVE" or "STAY" */
+} TuplestoreStructureTwoNode;
 
 
 /*

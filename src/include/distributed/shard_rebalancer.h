@@ -203,6 +203,7 @@ extern Datum update_shard_placement(PG_FUNCTION_ARGS);
 extern Datum init_rebalance_monitor(PG_FUNCTION_ARGS);
 extern Datum finalize_rebalance_monitor(PG_FUNCTION_ARGS);
 extern Datum get_rebalance_progress(PG_FUNCTION_ARGS);
+extern Datum get_rebalance_plan_for_two_nodes(PG_FUNCTION_ARGS);
 
 extern List * RebalancePlacementUpdates(List *workerNodeList,
 										List *shardPlacementListList,

@@ -318,6 +318,7 @@ PG_FUNCTION_INFO_V1(pg_dist_rebalance_strategy_enterprise_check);
 PG_FUNCTION_INFO_V1(citus_rebalance_start);
 PG_FUNCTION_INFO_V1(citus_rebalance_stop);
 PG_FUNCTION_INFO_V1(citus_rebalance_wait);
+PG_FUNCTION_INFO_V1(get_rebalance_plan_for_two_nodes);
 
 bool RunningUnderCitusTestSuite = false;
 int MaxRebalancerLoggedIgnoredMoves = 5;
@@ -3544,6 +3545,241 @@ EnsureShardCostUDF(Oid functionOid)
 						errdetail("return type of %s should be real", name)));
 	}
 	ReleaseSysCache(proctup);
+}
+
+
+/*
+ * get_rebalance_plan_for_two_nodes function calculates the shard move steps
+ * required for rebalancing shards between two specific worker nodes.
+ * The first worker node is considered the source, and the second is the target.
+ *
+ * SQL signature:
+ *
+ * get_rebalance_plan_for_two_nodes(
+ *     source_node_name text,
+ *     source_node_port integer,
+ *     target_node_name text,
+ *     target_node_port integer,
+ *     relation regclass DEFAULT NULL,
+ *     excluded_shard_list bigint[] DEFAULT '{}',
+ *     rebalance_strategy name DEFAULT NULL
+ * )
+ */
+Datum
+get_rebalance_plan_for_two_nodes(PG_FUNCTION_ARGS)
+{
+	CheckCitusVersion(ERROR);
+
+	text *sourceNodeNameText = PG_GETARG_TEXT_P(0);
+	int32 sourceNodePort = PG_GETARG_INT32(1);
+	text *targetNodeNameText = PG_GETARG_TEXT_P(2);
+	int32 targetNodePort = PG_GETARG_INT32(3);
+
+	char *sourceNodeName = text_to_cstring(sourceNodeNameText);
+	char *targetNodeName = text_to_cstring(targetNodeNameText);
+
+	WorkerNode *sourceNode = FindWorkerNodeOrError(sourceNodeName, sourceNodePort);
+	WorkerNode *targetNode = FindWorkerNodeOrError(targetNodeName, targetNodePort);
+
+	List *relationIdList = NIL;
+	if (!PG_ARGISNULL(4))
+	{
+		Oid relationId = PG_GETARG_OID(4);
+		ErrorIfMoveUnsupportedTableType(relationId);
+		relationIdList = list_make1_oid(relationId);
+	}
+	else
+	{
+		relationIdList = NonColocatedDistRelationIdList();
+	}
+
+	ArrayType *excludedShardArray = PG_GETARG_ARRAYTYPE_P_IF_EXISTS(5, construct_empty_array(INT8OID));
+
+	Form_pg_dist_rebalance_strategy strategy = GetRebalanceStrategy(
+		PG_GETARG_NAME_OR_NULL(6));
+
+	RebalanceOptions options = {
+		.relationIdList = relationIdList,
+		.threshold = 0, /* Threshold is not strictly needed for two nodes */
+		.maxShardMoves = -1, /* No limit on moves between these two nodes */
+		.excludedShardArray = excludedShardArray,
+		.drainOnly = false, /* Not a drain operation */
+		.rebalanceStrategy = strategy,
+		.improvementThreshold = 0, /* Consider all beneficial moves */
+		.workerNode = sourceNode /* Special field to indicate source node */
+	};
+
+	List *activeWorkerList = list_make2(sourceNode, targetNode);
+
+	/* Initialize rebalance plan functions and context */
+	EnsureShardCostUDF(options.rebalanceStrategy->shardCostFunction);
+	EnsureNodeCapacityUDF(options.rebalanceStrategy->nodeCapacityFunction);
+	EnsureShardAllowedOnNodeUDF(options.rebalanceStrategy->shardAllowedOnNodeFunction);
+
+	RebalanceContext context;
+	memset(&context, 0, sizeof(RebalanceContext));
+	fmgr_info(options.rebalanceStrategy->shardCostFunction, &context.shardCostUDF);
+	fmgr_info(options.rebalanceStrategy->nodeCapacityFunction, &context.nodeCapacityUDF);
+	fmgr_info(options.rebalanceStrategy->shardAllowedOnNodeFunction,
+			  &context.shardAllowedOnNodeUDF);
+
+	RebalancePlanFunctions rebalancePlanFunctions = {
+		.shardAllowedOnNode = ShardAllowedOnNode,
+		.nodeCapacity = NodeCapacity,
+		.shardCost = GetShardCost,
+		.context = &context,
+	};
+
+	/*
+	 * Collect all active shard placements on the source node for the given relations.
+	 * Unlike the main rebalancer, we build a single list of all relevant source placements
+	 * across all specified relations (or all relations if none specified).
+	 */
+	List *allSourcePlacements = NIL;
+	Oid relationIdItr = InvalidOid;
+	foreach_declared_oid(relationIdItr, options.relationIdList)
+	{
+		List *shardPlacementList = FullShardPlacementList(relationIdItr,
+														  options.excludedShardArray);
+		List *activeShardPlacementsForRelation =
+			FilterShardPlacementList(shardPlacementList, IsActiveShardPlacement);
+
+		ShardPlacement *placement = NULL;
+		foreach_declared_ptr(placement, activeShardPlacementsForRelation)
+		{
+			if (placement->nodeId == sourceNode->nodeId)
+			{
+				/* Ensure we don't add duplicate shardId if it's somehow listed under multiple relations */
+				bool alreadyAdded = false;
+				ShardPlacement *existingPlacement = NULL;
+				foreach_declared_ptr(existingPlacement, allSourcePlacements)
+				{
+					if (existingPlacement->shardId == placement->shardId)
+					{
+						alreadyAdded = true;
+						break;
+					}
+				}
+				if (!alreadyAdded)
+				{
+					allSourcePlacements = lappend(allSourcePlacements, placement);
+				}
+			}
+		}
+	}
+
+	List *placementUpdateList = NIL;
+	if (list_length(allSourcePlacements) > 0)
+	{
+		/*
+		 * Initialize RebalanceState considering only the source node's shards
+		 * and the two active workers (source and target).
+		 */
+		RebalanceState *state = InitRebalanceState(activeWorkerList, allSourcePlacements, &rebalancePlanFunctions);
+		state->placementUpdateList = NIL; /* Start with an empty list for this specific plan */
+
+		NodeFillState *sourceFillState = NULL;
+		NodeFillState *targetFillState = NULL;
+		ListCell *fsc = NULL;
+
+		/* Identify the fill states for our specific source and target nodes */
+		foreach(fsc, state->fillStateListAsc) /* Could be fillStateListDesc too, order doesn't matter here */
+		{
+			NodeFillState *fs = (NodeFillState *) lfirst(fsc);
+			if (fs->node->nodeId == sourceNode->nodeId)
+			{
+				sourceFillState = fs;
+			}
+			else if (fs->node->nodeId == targetNode->nodeId)
+			{
+				targetFillState = fs;
+			}
+		}
+
+		if (sourceFillState != NULL && targetFillState != NULL)
+		{
+			/*
+			 * The goal is to move roughly half the total cost from source to target.
+			 * The target node is assumed to be empty or its existing load is not
+			 * considered for this specific two-node balancing plan's shard distribution.
+			 * We calculate costs based *only* on the shards currently on the source node.
+			 */
+			float4 totalCostOfSourceShards = sourceFillState->totalCost;
+			float4 targetCostGoal = totalCostOfSourceShards / 2.0;
+			float4 currentTargetCostContribution = 0; /* Cost moved to target in this plan */
+
+			/* Sort shards on source node by cost (descending) to prioritize larger shards or apply some strategy */
+			sourceFillState->shardCostListDesc = SortList(sourceFillState->shardCostListDesc, CompareShardCostDesc);
+
+			ShardCost *shardCostToConsider = NULL;
+			foreach_declared_ptr(shardCostToConsider, sourceFillState->shardCostListDesc)
+			{
+				/*
+				 * Decide if this shard should move.
+				 * If target's accumulated cost is less than half the total, move this shard.
+				 */
+				if (currentTargetCostContribution < targetCostGoal)
+				{
+					/*
+					 * Ensure the shard is allowed on the target node.
+					 * For a truly empty target, this should generally be true unless
+					 * there are specific shard-node constraints defined by shardAllowedOnNodeUDF.
+					 */
+					if (state->functions->shardAllowedOnNode(shardCostToConsider->shardId,
+															 targetNode,
+															 state->functions->context))
+					{
+						PlacementUpdateEvent *update = palloc0(sizeof(PlacementUpdateEvent));
+						update->shardId = shardCostToConsider->shardId;
+						update->sourceNode = sourceNode; /* Actual source node */
+						update->targetNode = targetNode; /* Actual target node */
+						update->updateType = PLACEMENT_UPDATE_MOVE;
+						placementUpdateList = lappend(placementUpdateList, update);
+
+						currentTargetCostContribution += shardCostToConsider->cost;
+					}
+				}
+				else
+				{
+					/* Target has received its intended share of the load from the source node */
+					break;
+				}
+			}
+		}
+		/*
+		 * Note: We don't call hash_destroy(state->placementsHash) or free 'state' itself here
+		 * as it's typically handled by memory contexts in PostgreSQL.
+		 * The RebalanceState was initialized in the current memory context.
+		 */
+	}
+
+	TupleDesc tupdesc;
+	Tuplestorestate *tupstore = SetupTuplestore(fcinfo, &tupdesc);
+
+	ListCell *colocatedUpdateCell = NULL;
+	foreach(colocatedUpdateCell, placementUpdateList)
+	{
+		PlacementUpdateEvent *colocatedUpdate = lfirst(colocatedUpdateCell);
+		Datum values[7];
+		bool nulls[7];
+
+		memset(values, 0, sizeof(values));
+		memset(nulls, 0, sizeof(nulls));
+
+		values[0] = ObjectIdGetDatum(RelationIdForShard(colocatedUpdate->shardId));
+		values[1] = UInt64GetDatum(colocatedUpdate->shardId);
+		values[2] = UInt64GetDatum(ShardLength(colocatedUpdate->shardId));
+		values[3] = PointerGetDatum(cstring_to_text(
+										colocatedUpdate->sourceNode->workerName));
+		values[4] = UInt32GetDatum(colocatedUpdate->sourceNode->workerPort);
+		values[5] = PointerGetDatum(cstring_to_text(
+										colocatedUpdate->targetNode->workerName));
+		values[6] = UInt32GetDatum(colocatedUpdate->targetNode->workerPort);
+
+		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
+	}
+
+	return (Datum) 0;
 }
 
 

@@ -43,7 +43,7 @@
 #include "distributed/function_call_delegation.h"
 #include "distributed/insert_select_executor.h"
 #include "distributed/insert_select_planner.h"
-#include "distributed/listutils.h"
+#include "common/listutils.h"
 #include "distributed/local_executor.h"
 #include "distributed/multi_executor.h"
 #include "distributed/multi_router_planner.h"

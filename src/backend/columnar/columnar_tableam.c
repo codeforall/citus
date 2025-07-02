@@ -56,7 +56,7 @@
 #include "columnar/columnar_tableam.h"
 #include "columnar/columnar_version_compat.h"
 
-#include "distributed/listutils.h"
+#include "common/listutils.h"
 
 /*
  * Timing parameters for truncate locking heuristics.

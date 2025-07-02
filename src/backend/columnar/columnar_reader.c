@@ -38,7 +38,7 @@
 #include "columnar/columnar_tableam.h"
 #include "columnar/columnar_version_compat.h"
 
-#include "distributed/listutils.h"
+#include "common/listutils.h"
 
 #define UNEXPECTED_STRIPE_READ_ERR_MSG \
 	"attempted to read an unexpected stripe while reading columnar " \

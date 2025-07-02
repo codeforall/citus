@@ -121,10 +121,11 @@
 /* marks shared object as one loadable by the postgres version compiled against */
 PG_MODULE_MAGIC;
 
-ColumnarSupportsIndexAM_type extern_ColumnarSupportsIndexAM = NULL;
-CompressionTypeStr_type extern_CompressionTypeStr = NULL;
-IsColumnarTableAmTable_type extern_IsColumnarTableAmTable = NULL;
-ReadColumnarOptions_type extern_ReadColumnarOptions = NULL;
+bool IsColumnarModuleAvailable = false; // <-- ADDED
+CitusColumnarSupportsIndexAM_type extern_ColumnarSupportsIndexAM = NULL;
+// CompressionTypeStr_type extern_CompressionTypeStr = NULL; // REMOVED
+CitusIsColumnarTableAmTable_type extern_IsColumnarTableAmTable = NULL;
+// ReadColumnarOptions_type extern_ReadColumnarOptions = NULL; // REMOVED
 
 /*
  * Define "pass-through" functions so that a SQL function defined as one of
@@ -132,10 +133,17 @@ ReadColumnarOptions_type extern_ReadColumnarOptions = NULL;
  * module.
  */
 #define DEFINE_COLUMNAR_PASSTHROUGH_FUNC(funcname) \
-	static PGFunction CppConcat(extern_, funcname); \
+	static PGFunction CppConcat(extern_, funcname) = NULL; /* Initialize to NULL */ \
 	PG_FUNCTION_INFO_V1(funcname); \
 	Datum funcname(PG_FUNCTION_ARGS) \
 	{ \
+		if (!IsColumnarModuleAvailable || CppConcat(extern_, funcname) == NULL) \
+		{ \
+			ereport(ERROR, \
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED), \
+					 errmsg("Columnar function \"%s\" is not available.", #funcname), \
+					 errhint("Ensure the Columnar extension is installed and loaded."))); \
+		} \
 		return CppConcat(extern_, funcname)(fcinfo); \
 	}
 #define INIT_COLUMNAR_SYMBOL(typename, funcname) \
@@ -533,7 +541,7 @@ _PG_init(void)
 
 
 	/* ensure columnar module is loaded at the right time */
-	load_file(COLUMNAR_MODULE_NAME, false);
+	load_file(COLUMNAR_MODULE_NAME, true);
 
 	/*
 	 * Register utility hook. This must be done after loading columnar, so
@@ -555,25 +563,42 @@ _PG_init(void)
 	extern_ColumnarSupportsIndexAM = (ColumnarSupportsIndexAM_type) (void *)
 									 load_external_function(COLUMNAR_MODULE_NAME,
 															"ColumnarSupportsIndexAM",
-															true, &handle);
+															true, &handle); // true for missing_ok for the symbol itself
+
+	if (handle != NULL && extern_ColumnarSupportsIndexAM != NULL)
+	{
+		IsColumnarModuleAvailable = true;
+
+		// Only try to load other symbols if the first one succeeded and module is present
+		// INIT_COLUMNAR_SYMBOL(CompressionTypeStr_type, CompressionTypeStr); // REMOVED
+		INIT_COLUMNAR_SYMBOL(CitusIsColumnarTableAmTable_type, IsColumnarTableAmTable);
+		// INIT_COLUMNAR_SYMBOL(ReadColumnarOptions_type, ReadColumnarOptions); // REMOVED
+
+		/* initialize symbols for "pass-through" functions */
+		INIT_COLUMNAR_SYMBOL(PGFunction, columnar_handler);
+		INIT_COLUMNAR_SYMBOL(PGFunction, alter_columnar_table_set);
+		INIT_COLUMNAR_SYMBOL(PGFunction, alter_columnar_table_reset);
+		INIT_COLUMNAR_SYMBOL(PGFunction, upgrade_columnar_storage);
+		INIT_COLUMNAR_SYMBOL(PGFunction, downgrade_columnar_storage);
+		INIT_COLUMNAR_SYMBOL(PGFunction, columnar_relation_storageid);
+		INIT_COLUMNAR_SYMBOL(PGFunction, columnar_storage_info);
+		INIT_COLUMNAR_SYMBOL(PGFunction, columnar_store_memory_stats);
+		INIT_COLUMNAR_SYMBOL(PGFunction, test_columnar_storage_write_new_page);
+	}
+	else
+	{
+		IsColumnarModuleAvailable = false;
+		// extern_ColumnarSupportsIndexAM will be NULL if symbol not found or handle is NULL
+		// Ensure other extern_ pointers are also NULL if we didn't try INIT_COLUMNAR_SYMBOL
+		// extern_CompressionTypeStr = NULL; // REMOVED
+		extern_IsColumnarTableAmTable = NULL; // Type already changed to CitusIsColumnarTableAmTable_type
+		// extern_ReadColumnarOptions = NULL; // REMOVED
+		// Passthrough PGFunction pointers are implicitly NULL via their static definition
+		// if INIT_COLUMNAR_SYMBOL is not called for them.
+	}
 
 	CacheRegisterRelcacheCallback(InvalidateDistRelationCacheCallback,
 								  (Datum) 0);
-
-	INIT_COLUMNAR_SYMBOL(CompressionTypeStr_type, CompressionTypeStr);
-	INIT_COLUMNAR_SYMBOL(IsColumnarTableAmTable_type, IsColumnarTableAmTable);
-	INIT_COLUMNAR_SYMBOL(ReadColumnarOptions_type, ReadColumnarOptions);
-
-	/* initialize symbols for "pass-through" functions */
-	INIT_COLUMNAR_SYMBOL(PGFunction, columnar_handler);
-	INIT_COLUMNAR_SYMBOL(PGFunction, alter_columnar_table_set);
-	INIT_COLUMNAR_SYMBOL(PGFunction, alter_columnar_table_reset);
-	INIT_COLUMNAR_SYMBOL(PGFunction, upgrade_columnar_storage);
-	INIT_COLUMNAR_SYMBOL(PGFunction, downgrade_columnar_storage);
-	INIT_COLUMNAR_SYMBOL(PGFunction, columnar_relation_storageid);
-	INIT_COLUMNAR_SYMBOL(PGFunction, columnar_storage_info);
-	INIT_COLUMNAR_SYMBOL(PGFunction, columnar_store_memory_stats);
-	INIT_COLUMNAR_SYMBOL(PGFunction, test_columnar_storage_write_new_page);
 
 	/*
 	 * This part is only for SECURITY LABEL tests

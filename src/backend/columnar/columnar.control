@@ -1,0 +1,6 @@
+# Columnar extension (Standalone)
+comment = 'Standalone Columnar Storage extension'
+default_version = '1.0' # Or a versioning scheme TBD
+module_pathname = '$libdir/columnar'
+relocatable = false
+schema = pg_catalog

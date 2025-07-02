@@ -60,7 +60,7 @@
 #include "columnar/columnar_storage.h"
 #include "columnar/columnar_version_compat.h"
 
-#include "distributed/listutils.h"
+#include "common/listutils.h"
 
 #if PG_VERSION_NUM >= PG_VERSION_16
 #include "parser/parse_relation.h"

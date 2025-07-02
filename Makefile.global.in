@@ -90,7 +90,7 @@ override BITCODE_CFLAGS := $(BITCODE_CFLAGS) @CITUS_BITCODE_CFLAGS@
 ifneq ($(GIT_VERSION),)
     override CFLAGS += -DGIT_VERSION=\"$(GIT_VERSION)\"
 endif
-override CPPFLAGS := @CPPFLAGS@ @CITUS_CPPFLAGS@ -I '${citus_abs_top_srcdir}/src/include' -I'${citus_top_builddir}/src/include' $(CPPFLAGS)
+override CPPFLAGS := @CPPFLAGS@ @CITUS_CPPFLAGS@ -I '${citus_abs_top_srcdir}/src/include' -I'${citus_top_builddir}/src/include' -I '${citus_abs_top_srcdir}/src/include/common' $(CPPFLAGS)
 override LDFLAGS += @LDFLAGS@ @CITUS_LDFLAGS@
 
 # optional file with user defined, additional, rules

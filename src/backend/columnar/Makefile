@@ -6,9 +6,10 @@ SUBDIRS +=
 ENSURE_SUBDIRS_EXIST := $(shell mkdir -p $(SUBDIRS))
 OBJS += \
 	$(patsubst $(citus_abs_srcdir)/%.c,%.o,$(foreach dir,$(SUBDIRS), $(sort $(wildcard $(citus_abs_srcdir)/$(dir)/*.c))))
+# Common library object files are removed from OBJS, will be linked via static library
 
-MODULE_big = citus_columnar
-EXTENSION = citus_columnar
+MODULE_big = columnar
+EXTENSION = columnar
 
 template_sql_files = $(patsubst $(citus_abs_srcdir)/%,%,$(wildcard $(citus_abs_srcdir)/sql/*.sql))
 template_downgrade_sql_files = $(patsubst $(citus_abs_srcdir)/sql/downgrades/%,%,$(wildcard $(citus_abs_srcdir)/sql/downgrades/*.sql))
@@ -18,6 +19,9 @@ generated_downgrade_sql_files += $(patsubst %,$(citus_abs_srcdir)/build/sql/%,$(
 DATA_built = $(generated_sql_files)
 
 PG_CPPFLAGS += -I$(libpq_srcdir) -I$(safestringlib_srcdir)/include
+
+# Link common static library
+SHLIB_LINK += $(citus_top_builddir)/src/backend/common/libcituscommon.a
 
 include $(citus_top_builddir)/Makefile.global
 
@@ -42,10 +46,10 @@ $(generated_downgrade_sql_files): $(citus_abs_srcdir)/build/sql/%: sql/downgrade
 	@# `man cpp` for further information
 	cd $(citus_abs_srcdir) && cpp -undef -w -P -MMD -MP -MF$(SQL_DEPDIR)/$(*F).Po -MT$@ $< > $@
 
-.PHONY: install install-downgrades install-all
+.PHONY: install install-downgrades install-all clean-full
 
 cleanup-before-install:
-	rm -f $(DESTDIR)$(datadir)/$(datamoduledir)/citus_columnar.control
+	rm -f $(DESTDIR)$(datadir)/$(datamoduledir)/columnar.control
 	rm -f $(DESTDIR)$(datadir)/$(datamoduledir)/columnar--*
 	rm -f $(DESTDIR)$(datadir)/$(datamoduledir)/citus_columnar--*
 
@@ -58,3 +62,6 @@ install-all: install
 install-downgrades: $(generated_downgrade_sql_files)
 	$(INSTALL_DATA) $(generated_downgrade_sql_files) '$(DESTDIR)$(datadir)/$(datamoduledir)/'
 
+clean-full: clean
+	rm -rf $(citus_abs_srcdir)/build $(citus_abs_srcdir)/.deps
+	rm -f $(MODULE_big).so

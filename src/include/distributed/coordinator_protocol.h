@@ -19,7 +19,7 @@
 
 #include "nodes/pg_list.h"
 
-#include "columnar/columnar.h"
+// #include "columnar/columnar.h" // REMOVED
 
 #include "distributed/connection_management.h"
 #include "distributed/metadata_utility.h"
@@ -188,12 +188,12 @@ struct TableDDLCommand
  * ColumnarTableDDLContext holds the instance variable for the TableDDLCommandFunction
  * instance described below.
  */
-typedef struct ColumnarTableDDLContext
-{
-	char *schemaName;
-	char *relationName;
-	ColumnarOptions options;
-} ColumnarTableDDLContext;
+// typedef struct ColumnarTableDDLContext // REMOVED
+// {
+// 	char *schemaName;
+// 	char *relationName;
+// 	ColumnarOptions options;
+// } ColumnarTableDDLContext;
 
 /* make functions for TableDDLCommand */
 extern TableDDLCommand * makeTableDDLCommandString(char *commandStr);
@@ -204,11 +204,11 @@ extern TableDDLCommand * makeTableDDLCommandFunction(TableDDLFunction function,
 
 extern char * GetShardedTableDDLCommand(TableDDLCommand *command, uint64 shardId,
 										char *schemaName);
-extern char * GetShardedTableDDLCommandColumnar(uint64 shardId, void *context);
+// extern char * GetShardedTableDDLCommandColumnar(uint64 shardId, void *context); // REMOVED
 extern char * GetTableDDLCommand(TableDDLCommand *command);
-extern TableDDLCommand * ColumnarGetCustomTableOptionsDDL(char *schemaName,
-														  char *relationName,
-														  ColumnarOptions options);
+// extern TableDDLCommand * ColumnarGetCustomTableOptionsDDL(char *schemaName, // REMOVED
+// 														  char *relationName,
+// 														  ColumnarOptions options);
 
 
 /* Config variables managed via guc.c */

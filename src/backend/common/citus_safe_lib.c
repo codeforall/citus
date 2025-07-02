@@ -16,13 +16,13 @@
 
 #include "postgres.h"
 
-#include "safe_lib.h"
+#include "safe_lib.h" // This comes from vendor/safestringlib
 
 #include "lib/stringinfo.h"
 
 #include "pg_version_constants.h"
 
-#include "distributed/citus_safe_lib.h"
+#include "common/citus_safe_lib.h" // Adjusted include path
 
 
 /*

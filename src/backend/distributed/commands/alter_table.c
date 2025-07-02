@@ -41,8 +41,9 @@
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
 
-#include "columnar/columnar.h"
-#include "columnar/columnar_tableam.h"
+// Columnar includes removed
+// #include "columnar/columnar.h"
+// #include "columnar/columnar_tableam.h"
 
 #include "distributed/colocation_utils.h"
 #include "distributed/commands.h"
@@ -51,7 +52,7 @@
 #include "distributed/deparser.h"
 #include "distributed/distribution_column.h"
 #include "distributed/hash_helpers.h"
-#include "distributed/listutils.h"
+#include "common/listutils.h"
 #include "distributed/local_executor.h"
 #include "distributed/metadata/dependency.h"
 #include "distributed/metadata/distobject.h"
@@ -885,26 +886,19 @@ ConvertTableInternal(TableConversionState *con)
 								NULL, None_Receiver, NULL);
 	}
 
-	/* set columnar options */
-	if (con->accessMethod == NULL && con->originalAccessMethod &&
-		strcmp(con->originalAccessMethod, "columnar") == 0)
-	{
-		ColumnarOptions options = { 0 };
-		extern_ReadColumnarOptions(con->relationId, &options);
-
-		ColumnarTableDDLContext *context = (ColumnarTableDDLContext *) palloc0(
-			sizeof(ColumnarTableDDLContext));
-
-		/* build the context */
-		context->schemaName = con->schemaName;
-		context->relationName = con->relationName;
-		context->options = options;
-
-		char *columnarOptionsSql = GetShardedTableDDLCommandColumnar(con->hashOfName,
-																	 context);
-
-		ExecuteQueryViaSPI(columnarOptionsSql, SPI_OK_UTILITY);
-	}
+	/* set columnar options - REMOVED */
+	// if (con->accessMethod == NULL && con->originalAccessMethod &&
+	// 	strcmp(con->originalAccessMethod, "columnar") == 0)
+	// {
+	// 	if (IsColumnarModuleAvailable && extern_ReadColumnarOptions) // This pointer was removed
+	// 	{
+	// 		// Logic to read and apply ColumnarOptions would go here,
+	// 		// but we are removing it for now to simplify decoupling.
+	// 		// The new table will get default columnar options if it's made columnar.
+	// 		// Users would need to re-apply custom options if desired.
+	// 		ereport(DEBUG1, (errmsg("Skipping preservation of columnar options for table %s during conversion for decoupling.", con->relationName)));
+	// 	}
+	// }
 
 	con->newRelationId = get_relname_relid(con->tempName, con->schemaId);
 
@@ -1132,7 +1126,24 @@ DropIndexesNotSupportedByColumnar(Oid relationId, bool suppressNoticeMessages)
 	foreach_declared_oid(indexId, indexIdList)
 	{
 		char *indexAmName = GetIndexAccessMethodName(indexId);
-		if (extern_ColumnarSupportsIndexAM(indexAmName))
+
+		bool supported = true; // Assume supported if columnar module or function is not available
+		if (IsColumnarModuleAvailable && extern_ColumnarSupportsIndexAM != NULL)
+		{
+			supported = extern_ColumnarSupportsIndexAM(indexAmName);
+		}
+		else if (IsColumnarModuleAvailable && extern_ColumnarSupportsIndexAM == NULL)
+		{
+			// This case should ideally not happen if module is loaded correctly.
+			// Consider erroring or warning more strongly. For now, treat as unsupported.
+			// supported = false;
+			ereport(WARNING, (errmsg("Columnar module is loaded but ColumnarSupportsIndexAM function is not available. Assuming index AM '%s' is not supported by columnar.", indexAmName)));
+			supported = false;
+		}
+		// If !IsColumnarModuleAvailable, we assume indexes are "supported" because the concept of columnar support is moot.
+		// The table AM change to 'columnar' would fail if the module isn't there anyway.
+
+		if (supported)
 		{
 			continue;
 		}

@@ -34,9 +34,8 @@
 #include "utils/typcache.h"
 
 #include "distributed/causal_clock.h"
-#include "distributed/citus_safe_lib.h"
-#include "distributed/coordinator_protocol.h"
-#include "distributed/listutils.h"
+#include "common/citus_safe_lib.h"
+#include "common/listutils.h"
 #include "distributed/local_executor.h"
 #include "distributed/lock_graph.h"
 #include "distributed/metadata_cache.h"

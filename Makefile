@@ -11,19 +11,27 @@ endif
 
 include Makefile.global
 
-all: extension
+# Build common library first
+all: common columnar extension
 
+# build common static library
+common:
+	$(MAKE) -C src/backend/common all
 
 # build columnar only
-columnar:
+columnar: common
 	$(MAKE) -C src/backend/columnar all
+
 # build extension
-extension: $(citus_top_builddir)/src/include/citus_version.h columnar
+extension: common $(citus_top_builddir)/src/include/citus_version.h
 	$(MAKE) -C src/backend/distributed/ all
+
 install-columnar: columnar
 	$(MAKE) -C src/backend/columnar install
-install-extension: extension install-columnar
+
+install-extension: extension
 	$(MAKE) -C src/backend/distributed/ install
+
 install-headers: extension
 	$(MKDIR_P) '$(DESTDIR)$(includedir_server)/distributed/'
 # generated headers are located in the build directory
@@ -34,20 +42,26 @@ install-headers: extension
 clean-extension:
 	$(MAKE) -C src/backend/distributed/ clean
 	$(MAKE) -C src/backend/columnar/ clean
+	$(MAKE) -C src/backend/common/ clean
+
 clean-full:
 	$(MAKE) -C src/backend/distributed/ clean-full
-.PHONY: extension install-extension clean-extension clean-full
+	$(MAKE) -C src/backend/columnar/ clean-full # Assuming columnar might have a clean-full
+	$(MAKE) -C src/backend/common/ clean # common might not have clean-full, just clean
+.PHONY: common extension install-extension clean-extension clean-full
 
 install-downgrades:
+	$(MAKE) -C src/backend/columnar/ install-downgrades # Assuming columnar has downgrades
 	$(MAKE) -C src/backend/distributed/ install-downgrades
-install-all: install-headers
-	$(MAKE) -C src/backend/columnar/ install-all
-	$(MAKE) -C src/backend/distributed/ install-all
 
 
 # Add to generic targets
 install: install-extension install-headers
 clean: clean-extension
+
+# install-all should install everything
+install-all: install-columnar install-extension install-headers install-downgrades
+
 
 # apply or check style
 reindent:

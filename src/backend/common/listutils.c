@@ -19,8 +19,8 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 
-#include "distributed/citus_safe_lib.h"
-#include "distributed/listutils.h"
+#include "common/citus_safe_lib.h" // This will need to become common/citus_safe_lib.h
+#include "common/listutils.h" // Adjusted include path
 
 
 /*

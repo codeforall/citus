@@ -23,7 +23,7 @@
 #include "pg_version_compat.h"
 #include "pg_version_constants.h"
 
-#include "distributed/citus_safe_lib.h"
+#include "common/citus_safe_lib.h"
 #include "distributed/commands.h"
 #include "distributed/commands/utility_hook.h"
 #include "distributed/deparser.h"

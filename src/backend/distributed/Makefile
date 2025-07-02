@@ -30,6 +30,7 @@ ENSURE_SUBDIRS_EXIST := $(shell mkdir -p $(SUBDIRS))
 # files, and adds the corresponding .o files to OBJS
 OBJS += \
 	$(patsubst $(citus_abs_srcdir)/%.c,%.o,$(foreach dir,$(SUBDIRS), $(sort $(wildcard $(citus_abs_srcdir)/$(dir)/*.c))))
+# Common library object files are removed from OBJS, will be linked via static library
 
 # be explicit about the default target
 .PHONY: cdc
@@ -42,6 +43,7 @@ cdc:
 NO_PGXS = 1
 
 SHLIB_LINK = $(libpq)
+SHLIB_LINK += $(citus_top_builddir)/src/backend/common/libcituscommon.a
 
 include $(citus_top_builddir)/Makefile.global
 

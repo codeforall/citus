@@ -50,7 +50,7 @@
 #include "columnar/columnar_metadata.h"
 #include "columnar/columnar_tableam.h"
 
-#include "distributed/listutils.h"
+#include "common/listutils.h"
 
 /*
  * ColumnarScanState represents the state for a columnar scan. It's a

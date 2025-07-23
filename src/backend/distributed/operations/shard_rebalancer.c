@@ -952,6 +952,7 @@ SetupRebalanceMonitor(List *placementUpdateList,
 		event->updateType = colocatedUpdate->updateType;
 		pg_atomic_init_u64(&event->updateStatus, initialStatus);
 		pg_atomic_init_u64(&event->progress, initialProgressState);
+		event->total_size = ShardSize(colocatedUpdate->shardId);
 
 		eventIndex++;
 	}
@@ -1336,6 +1337,7 @@ get_rebalance_table_shards_plan(PG_FUNCTION_ARGS)
 		values[5] = PointerGetDatum(cstring_to_text(
 										colocatedUpdate->targetNode->workerName));
 		values[6] = UInt32GetDatum(colocatedUpdate->targetNode->workerPort);
+		values[7] = UInt64GetDatum(ShardSize(colocatedUpdate->shardId));
 
 		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
 	}
@@ -1430,6 +1432,17 @@ get_rebalance_progress(PG_FUNCTION_ARGS)
 											 PlacementUpdateStatusNames[
 												 pg_atomic_read_u64(
 													 &step->updateStatus)]));
+			values[15] = UInt64GetDatum(step->total_size);
+			values[16] = UInt64GetDatum(targetSize);
+			values[17] = UInt64GetDatum(step->total_size - targetSize);
+			if (step->total_size > 0)
+			{
+				values[18] = Float8GetDatum((double) targetSize / step->total_size * 100);
+			}
+			else
+			{
+				values[18] = Float8GetDatum(100.0);
+			}
 
 			tuplestore_putvalues(tupstore, tupdesc, values, nulls);
 		}
@@ -1662,9 +1675,15 @@ BuildWorkerShardStatisticsHash(PlacementUpdateEventProgress *steps, int stepCoun
 
 
 /*
- * GetShardStatistics fetches the statics for the given shard ids over the
+ * GetShardStatistics fetches the statistics for the given shard ids over the
  * given connection. It returns a hashmap where the keys are the shard ids and
  * the values are the statistics.
+ *
+ * The function constructs a single query that fetches the size and LSN for all
+ * the shards in the shardIds hash set. The query uses a WITH clause to create a
+ * temporary table of shard names, and then joins it with pg_class and
+ * pg_namespace to get the relation size. The LSN is fetched from the
+ * pg_stat_subscription table.
  */
 static HTAB *
 GetShardStatistics(MultiConnection *connection, HTAB *shardIds)
@@ -2426,6 +2445,10 @@ GetSetCommandListForNewConnections(void)
  * make sure different colocation groups are balanced separately, so each list
  * contains the placements of a colocation group.
  */
+static List * InitializeRebalanceStates(List *workerNodeList, List *activeShardPlacementListList, RebalancePlanFunctions *functions);
+static List * MoveDisallowedPlacements(List *rebalanceStates);
+static List * BalanceShards(List *rebalanceStates, double threshold, int32 maxShardMoves, bool drainOnly, float4 improvementThreshold);
+
 List *
 RebalancePlacementUpdates(List *workerNodeList, List *activeShardPlacementListList,
 						  double threshold,
@@ -2434,59 +2457,11 @@ RebalancePlacementUpdates(List *workerNodeList, List *activeShardPlacementListLi
 						  float4 improvementThreshold,
 						  RebalancePlanFunctions *functions)
 {
-	List *rebalanceStates = NIL;
+	List *rebalanceStates = InitializeRebalanceStates(workerNodeList, activeShardPlacementListList, functions);
+	List *placementUpdateList = MoveDisallowedPlacements(rebalanceStates);
+	placementUpdateList = BalanceShards(rebalanceStates, threshold, maxShardMoves, drainOnly, improvementThreshold);
+
 	RebalanceState *state = NULL;
-	List *shardPlacementList = NIL;
-	List *placementUpdateList = NIL;
-
-	foreach_declared_ptr(shardPlacementList, activeShardPlacementListList)
-	{
-		state = InitRebalanceState(workerNodeList, shardPlacementList,
-								   functions);
-		rebalanceStates = lappend(rebalanceStates, state);
-	}
-
-	foreach_declared_ptr(state, rebalanceStates)
-	{
-		state->placementUpdateList = placementUpdateList;
-		MoveShardsAwayFromDisallowedNodes(state);
-		placementUpdateList = state->placementUpdateList;
-	}
-
-	if (!drainOnly)
-	{
-		foreach_declared_ptr(state, rebalanceStates)
-		{
-			state->placementUpdateList = placementUpdateList;
-
-			/* calculate lower bound for placement count */
-			float4 averageUtilization = (state->totalCost / state->totalCapacity);
-			float4 utilizationLowerBound = ((1.0 - threshold) * averageUtilization);
-			float4 utilizationUpperBound = ((1.0 + threshold) * averageUtilization);
-
-			bool moreMovesAvailable = true;
-			while (list_length(state->placementUpdateList) < maxShardMoves &&
-				   moreMovesAvailable)
-			{
-				moreMovesAvailable = FindAndMoveShardCost(
-					utilizationLowerBound,
-					utilizationUpperBound,
-					improvementThreshold,
-					state);
-			}
-			placementUpdateList = state->placementUpdateList;
-
-			if (moreMovesAvailable)
-			{
-				ereport(NOTICE, (errmsg(
-									 "Stopped searching before we were out of moves. "
-									 "Please rerun the rebalancer after it's finished "
-									 "for a more optimal placement.")));
-				break;
-			}
-		}
-	}
-
 	foreach_declared_ptr(state, rebalanceStates)
 	{
 		hash_destroy(state->placementsHash);
@@ -2527,6 +2502,84 @@ RebalancePlacementUpdates(List *workerNodeList, List *activeShardPlacementListLi
 						));
 		}
 	}
+	return placementUpdateList;
+}
+
+static List *
+InitializeRebalanceStates(List *workerNodeList, List *activeShardPlacementListList,
+						  RebalancePlanFunctions *functions)
+{
+	List *rebalanceStates = NIL;
+	RebalanceState *state = NULL;
+	List *shardPlacementList = NIL;
+
+	foreach_declared_ptr(shardPlacementList, activeShardPlacementListList)
+	{
+		state = InitRebalanceState(workerNodeList, shardPlacementList,
+								   functions);
+		rebalanceStates = lappend(rebalanceStates, state);
+	}
+
+	return rebalanceStates;
+}
+
+static List *
+MoveDisallowedPlacements(List *rebalanceStates)
+{
+	List *placementUpdateList = NIL;
+	RebalanceState *state = NULL;
+
+	foreach_declared_ptr(state, rebalanceStates)
+	{
+		state->placementUpdateList = placementUpdateList;
+		MoveShardsAwayFromDisallowedNodes(state);
+		placementUpdateList = state->placementUpdateList;
+	}
+
+	return placementUpdateList;
+}
+
+static List *
+BalanceShards(List *rebalanceStates, double threshold, int32 maxShardMoves, bool drainOnly,
+			  float4 improvementThreshold)
+{
+	List *placementUpdateList = NIL;
+	RebalanceState *state = NULL;
+
+	if (!drainOnly)
+	{
+		foreach_declared_ptr(state, rebalanceStates)
+		{
+			state->placementUpdateList = placementUpdateList;
+
+			/* calculate lower bound for placement count */
+			float4 averageUtilization = (state->totalCost / state->totalCapacity);
+			float4 utilizationLowerBound = ((1.0 - threshold) * averageUtilization);
+			float4 utilizationUpperBound = ((1.0 + threshold) * averageUtilization);
+
+			bool moreMovesAvailable = true;
+			while (list_length(state->placementUpdateList) < maxShardMoves &&
+				   moreMovesAvailable)
+			{
+				moreMovesAvailable = FindAndMoveShardCost(
+					utilizationLowerBound,
+					utilizationUpperBound,
+					improvementThreshold,
+					state);
+			}
+			placementUpdateList = state->placementUpdateList;
+
+			if (moreMovesAvailable)
+			{
+				ereport(NOTICE, (errmsg(
+									 "Stopped searching before we were out of moves. "
+									 "Please rerun the rebalancer after it's finished "
+									 "for a more optimal placement.")));
+				break;
+			}
+		}
+	}
+
 	return placementUpdateList;
 }
 
@@ -2878,14 +2931,16 @@ MoveShardCost(NodeFillState *sourceFillState,
 
 
 /*
- * FindAndMoveShardCost is the main rebalancing algorithm. This takes the
- * current state and returns a list with a new move appended that improves the
- * balance of shards. The algorithm is greedy and will use the first new move
- * that improves the balance. It finds nodes by trying to move a shard from the
- * most utilized node (highest utilization) to the emptiest node (lowest
- * utilization). If no moves are possible it will try the second emptiest node
- * until it tried all of them. Then it wil try the second fullest node. If it
- * was able to find a move it will return true and false if it couldn't.
+ * FindAndMoveShardCost is the main rebalancing algorithm. This function iterates
+ * through all possible shard moves and returns the first move that improves the
+ * balance of the cluster. The function returns true if a move was found, and
+ * false otherwise.
+ *
+ * The algorithm is greedy and will use the first new move that improves the
+ * balance. It finds nodes by trying to move a shard from the most utilized node
+ * (highest utilization) to the emptiest node (lowest utilization). If no moves
+ * are possible it will try the second emptiest node until it tried all of them.
+ * Then it wil try the second fullest node.
  *
  * This algorithm won't necessarily result in the best possible balance. Getting
  * the best balance is an NP problem, so it's not feasible to go for the best

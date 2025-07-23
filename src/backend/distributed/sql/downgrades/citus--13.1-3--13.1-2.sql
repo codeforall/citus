@@ -1,0 +1,2 @@
+DROP INDEX pg_catalog.pg_class_relname_relnamespace_idx;
+DROP INDEX pg_dist_partition_colocationid_idx;

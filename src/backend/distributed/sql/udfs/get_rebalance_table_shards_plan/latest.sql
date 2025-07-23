@@ -19,7 +19,8 @@ CREATE OR REPLACE FUNCTION pg_catalog.get_rebalance_table_shards_plan(
                    sourcename text,
                    sourceport int,
                    targetname text,
-                   targetport int)
+                   targetport int,
+                   total_size bigint)
     AS 'MODULE_PATHNAME'
     LANGUAGE C VOLATILE;
 COMMENT ON FUNCTION pg_catalog.get_rebalance_table_shards_plan(regclass, float4, int, bigint[], boolean, name, float4)

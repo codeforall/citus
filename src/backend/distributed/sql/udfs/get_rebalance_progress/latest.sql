@@ -15,7 +15,11 @@ CREATE OR REPLACE FUNCTION pg_catalog.get_rebalance_progress()
                 operation_type text,
                 source_lsn pg_lsn,
                 target_lsn pg_lsn,
-                status text
+                status text,
+                total_size bigint,
+                moved_size bigint,
+                remaining_size bigint,
+                progress_percentage float8
             )
   AS 'MODULE_PATHNAME'
   LANGUAGE C STRICT;

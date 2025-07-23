@@ -124,6 +124,7 @@ typedef struct PlacementUpdateEventProgress
 	PlacementUpdateType updateType;
 	pg_atomic_uint64 progress;
 	pg_atomic_uint64 updateStatus;
+	uint64 total_size;
 } PlacementUpdateEventProgress;
 
 typedef struct NodeFillState

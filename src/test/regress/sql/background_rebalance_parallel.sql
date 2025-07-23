@@ -394,13 +394,196 @@ FROM pg_dist_background_task_depend D  WHERE job_id in (:job_id) ORDER BY D.task
 SELECT citus_rebalance_stop();
 DELETE FROM pg_catalog.pg_dist_rebalance_strategy WHERE name='test_source_then_target';
 
+-- PART 4
+-- Test to verify that the dependency logic is robust with a more complex
+-- colocation pattern.
+DROP SCHEMA background_rebalance_parallel CASCADE;
+TRUNCATE pg_dist_background_job CASCADE;
+TRUNCATE pg_dist_background_task CASCADE;
+TRUNCATE pg_dist_background_task_depend;
+SELECT public.wait_for_resource_cleanup();
+select citus_remove_node('localhost', :worker_1_port);
+select citus_remove_node('localhost', :worker_2_port);
+select citus_remove_node('localhost', :worker_3_port);
+CREATE SCHEMA background_rebalance_parallel;
+SET search_path TO background_rebalance_parallel;
+SET citus.next_shard_id TO 85674051;
+ALTER SEQUENCE pg_catalog.pg_dist_node_nodeid_seq RESTART 61;
+
+-- add the first node
+-- nodeid here is 61
+select citus_add_node('localhost', :worker_1_port);
+-- nodeid here is 62
+select citus_add_node('localhost', :worker_2_port);
+-- nodeid here is 63
+select citus_add_node('localhost', :worker_3_port);
+
+-- Create 3 tables in 3 colocation groups, and populate them
+CREATE TABLE table1_colg1 (a int PRIMARY KEY);
+SELECT create_distributed_table('table1_colg1', 'a', shard_count => 2, colocate_with => 'none');
+INSERT INTO table1_colg1 SELECT i FROM generate_series(0, 100)i;
+
+CREATE TABLE table1_colg2 (a int PRIMARY KEY);
+SELECT create_distributed_table('table1_colg2', 'a', shard_count => 2, colocate_with => 'table1_colg1');
+
+CREATE TABLE table1_colg3 (a int PRIMARY KEY);
+SELECT create_distributed_table('table1_colg3', 'a', shard_count => 2, colocate_with => 'none');
+INSERT INTO table1_colg3 SELECT i FROM generate_series(0, 100)i;
+
+-- manually balance the cluster such that we have
+-- colg1 on nodes 1,2
+-- colg2 on nodes 1,2
+-- colg3 on nodes 2,3
+SELECT pg_catalog.citus_move_shard_placement(85674053,61,62,'auto');
+SELECT pg_catalog.citus_move_shard_placement(85674054,61,62,'auto');
+
+SELECT pg_catalog.citus_move_shard_placement(85674055,61,62,'auto');
+SELECT pg_catalog.citus_move_shard_placement(85674056,61,63,'auto');
+
+-- add two new nodes so that we can rebalance
+SELECT 1 FROM citus_add_node('localhost', :worker_4_port);
+SELECT 1 FROM citus_add_node('localhost', :worker_5_port);
+
+SELECT * FROM get_rebalance_table_shards_plan() ORDER BY shardid;
+
+SELECT * FROM citus_rebalance_start();
+
+SELECT citus_rebalance_wait();
+
+SELECT S.shardid, P.colocationid
+FROM pg_dist_shard S, pg_dist_partition P
+WHERE S.logicalrelid = P.logicalrelid ORDER BY S.shardid ASC;
+
+SELECT D.task_id,
+       (SELECT T.command FROM pg_dist_background_task T WHERE T.task_id = D.task_id),
+       D.depends_on,
+       (SELECT T.command FROM pg_dist_background_task T WHERE T.task_id = D.depends_on)
+FROM pg_dist_background_task_depend D  WHERE job_id = 17780 ORDER BY D.task_id, D.depends_on ASC;
+
+
 DROP SCHEMA background_rebalance_parallel CASCADE;
 TRUNCATE pg_dist_background_job CASCADE;
 TRUNCATE pg_dist_background_task CASCADE;
 TRUNCATE pg_dist_background_task_depend;
 SELECT public.wait_for_resource_cleanup();
 select citus_remove_node('localhost', :worker_3_port);
+select citus_remove_node('localhost', :worker_4_port);
+select citus_remove_node('localhost', :worker_5_port);
 -- keep the rest of the tests inact that depends node/group ids
 ALTER SEQUENCE pg_catalog.pg_dist_groupid_seq RESTART :last_group_id_cls;
 ALTER SEQUENCE pg_catalog.pg_dist_node_nodeid_seq RESTART :last_node_id_cls;
 
+-- PART 6
+-- Test to verify that the rebalancer can recover from a shard move failure.
+DROP SCHEMA background_rebalance_parallel CASCADE;
+TRUNCATE pg_dist_background_job CASCADE;
+TRUNCATE pg_dist_background_task CASCADE;
+TRUNCATE pg_dist_background_task_depend;
+SELECT public.wait_for_resource_cleanup();
+select citus_remove_node('localhost', :worker_1_port);
+select citus_remove_node('localhost', :worker_2_port);
+CREATE SCHEMA background_rebalance_parallel;
+SET search_path TO background_rebalance_parallel;
+
+-- add 2 nodes
+SELECT 1 FROM citus_add_node('localhost', :worker_1_port);
+SELECT 1 FROM citus_add_node('localhost', :worker_2_port);
+
+-- create a table with 4 shards
+CREATE TABLE t1 (a int PRIMARY KEY);
+SELECT create_distributed_table('t1', 'a', shard_count => 4, colocate_with => 'none');
+
+-- add 2 more nodes
+SELECT 1 FROM citus_add_node('localhost', :worker_3_port);
+SELECT 1 FROM citus_add_node('localhost', :worker_4_port);
+
+-- get the rebalance plan
+SELECT * FROM get_rebalance_table_shards_plan() ORDER BY shardid;
+
+-- simulate a failure on the first move
+SELECT citus.mitmproxy('conn.onQuery(query="SELECT pg_catalog.citus_move_shard_placement(85674051,61,63,''auto'')").kill()');
+
+-- start the rebalance
+SELECT * FROM citus_rebalance_start();
+
+-- wait for the rebalance to complete
+SELECT citus_rebalance_wait();
+
+-- check the status of the rebalance
+SELECT state, details FROM citus_rebalance_status();
+
+-- check the shard placements
+SELECT shardid, nodename, nodeport FROM pg_dist_placement ORDER BY shardid;
+
+-- allow the move to succeed now
+SELECT citus.mitmproxy('conn.allow()');
+
+-- manually retry the failed move
+SELECT pg_catalog.citus_move_shard_placement(85674051,61,63,'auto');
+
+-- check the shard placements again
+SELECT shardid, nodename, nodeport FROM pg_dist_placement ORDER BY shardid;
+
+DROP SCHEMA background_rebalance_parallel CASCADE;
+TRUNCATE pg_dist_background_job CASCADE;
+TRUNCATE pg_dist_background_task CASCADE;
+TRUNCATE pg_dist_background_task_depend;
+SELECT public.wait_for_resource_cleanup();
+select citus_remove_node('localhost', :worker_1_port);
+select citus_remove_node('localhost', :worker_2_port);
+select citus_remove_node('localhost', :worker_3_port);
+select citus_remove_node('localhost', :worker_4_port);
+
+-- PART 5
+-- Test to verify that the rebalancer performs well with a larger number of
+-- shards and nodes.
+DROP SCHEMA background_rebalance_parallel CASCADE;
+TRUNCATE pg_dist_background_job CASCADE;
+TRUNCATE pg_dist_background_task CASCADE;
+TRUNCATE pg_dist_background_task_depend;
+SELECT public.wait_for_resource_cleanup();
+select citus_remove_node('localhost', :worker_1_port);
+select citus_remove_node('localhost', :worker_2_port);
+CREATE SCHEMA background_rebalance_parallel;
+SET search_path TO background_rebalance_parallel;
+
+-- add 5 nodes
+SELECT 1 FROM citus_add_node('localhost', :worker_1_port);
+SELECT 1 FROM citus_add_node('localhost', :worker_2_port);
+SELECT 1 FROM citus_add_node('localhost', :worker_3_port);
+SELECT 1 FROM citus_add_node('localhost', :worker_4_port);
+SELECT 1 FROM citus_add_node('localhost', :worker_5_port);
+
+-- create a table with 32 shards
+CREATE TABLE large_table (a int PRIMARY KEY);
+SELECT create_distributed_table('large_table', 'a', shard_count => 32, colocate_with => 'none');
+
+-- add 5 more nodes
+SELECT 1 FROM citus_add_node('localhost', :worker_6_port);
+SELECT 1 FROM citus_add_node('localhost', :worker_7_port);
+SELECT 1 FROM citus_add_node('localhost', :worker_8_port);
+SELECT 1 FROM citus_add_node('localhost', :worker_9_port);
+SELECT 1 FROM citus_add_node('localhost', :worker_10_port);
+
+-- rebalance the shards
+SELECT * FROM citus_rebalance_start();
+SELECT citus_rebalance_wait();
+
+-- check the number of moves
+SELECT count(*) FROM pg_dist_background_task WHERE job_id = (SELECT max(job_id) FROM pg_dist_background_job);
+
+DROP SCHEMA background_rebalance_parallel CASCADE;
+TRUNCATE pg_dist_background_job CASCADE;
+TRUNCATE pg_dist_background_task CASCADE;
+TRUNCATE pg_dist_background_task_depend;
+SELECT public.wait_for_resource_cleanup();
+select citus_remove_node('localhost', :worker_1_port);
+select citus_remove_node('localhost', :worker_2_port);
+select citus_remove_node('localhost', :worker_3_port);
+select citus_remove_node('localhost', :worker_4_port);
+select citus_remove_node('localhost', :worker_5_port);
+select citus_remove_node('localhost', :worker_6_port);
+select citus_remove_node('localhost', :worker_7_port);
+select citus_remove_node('localhost', :worker_8_port);
+select citus_remove_node('localhost', :worker_9_port);
+select citus_remove_node('localhost', :worker_10_port);

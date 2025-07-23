@@ -1519,6 +1519,18 @@ CreateShardCommandList(ShardInterval *shardInterval, List *ddlCommandList)
  * from a source node to target node via COPY command. While the command is in
  * progress, the modifications on the source node is blocked.
  */
+static void CreateShardTablesOnNode(List *shardIntervalList, char *sourceNodeName,
+									int32 sourceNodePort, char *targetNodeName,
+									int32 targetNodePort);
+static void CopyShardDataToNode(List *shardIntervalList, WorkerNode *sourceNode,
+								WorkerNode *targetNode);
+static void CreatePostLoadObjectsOnNode(List *shardIntervalList, char *sourceNodeName,
+										int32 sourceNodePort, char *targetNodeName,
+										int32 targetNodePort);
+static void CreateRelationshipsOnNode(List *shardIntervalList, char *sourceNodeName,
+									  int32 sourceNodePort, char *targetNodeName,
+									  int32 targetNodePort);
+
 static void
 CopyShardTablesViaBlockWrites(List *shardIntervalList, char *sourceNodeName,
 							  int32 sourceNodePort, char *targetNodeName,
@@ -1531,7 +1543,6 @@ CopyShardTablesViaBlockWrites(List *shardIntervalList, char *sourceNodeName,
 
 	WorkerNode *sourceNode = FindWorkerNode(sourceNodeName, sourceNodePort);
 	WorkerNode *targetNode = FindWorkerNode(targetNodeName, targetNodePort);
-	ShardInterval *shardInterval = NULL;
 
 	/*
 	 * If we’re only asked to create the relationships, the shards are already
@@ -1540,63 +1551,13 @@ CopyShardTablesViaBlockWrites(List *shardIntervalList, char *sourceNodeName,
 	 */
 	if (!(optionFlags & SHARD_TRANSFER_CREATE_RELATIONSHIPS_ONLY))
 	{
-		/* iterate through the colocated shards and copy each */
-		foreach_declared_ptr(shardInterval, shardIntervalList)
-		{
-			/*
-			 * For each shard we first create the shard table in a separate
-			 * transaction and then we copy the data and create the indexes in a
-			 * second separate transaction. The reason we don't do both in a single
-			 * transaction is so we can see the size of the new shard growing
-			 * during the copy when we run get_rebalance_progress in another
-			 * session. If we wouldn't split these two phases up, then the table
-			 * wouldn't be visible in the session that get_rebalance_progress uses.
-			 * So get_rebalance_progress would always report its size as 0.
-			 */
-			List *ddlCommandList = RecreateShardDDLCommandList(shardInterval,
-															   sourceNodeName,
-															   sourceNodePort);
-			char *tableOwner = TableOwner(shardInterval->relationId);
+		CreateShardTablesOnNode(shardIntervalList, sourceNodeName, sourceNodePort,
+								targetNodeName, targetNodePort);
 
-			/* drop the shard we created on the target, in case of failure */
-			InsertCleanupRecordOutsideTransaction(CLEANUP_OBJECT_SHARD_PLACEMENT,
-												  ConstructQualifiedShardName(
-													  shardInterval),
-												  GroupForNode(targetNodeName,
-															   targetNodePort),
-												  CLEANUP_ON_FAILURE);
+		CopyShardDataToNode(shardIntervalList, sourceNode, targetNode);
 
-			SendCommandListToWorkerOutsideTransaction(targetNodeName, targetNodePort,
-													  tableOwner, ddlCommandList);
-		}
-
-		UpdatePlacementUpdateStatusForShardIntervalList(
-			shardIntervalList,
-			sourceNodeName,
-			sourceNodePort,
-			PLACEMENT_UPDATE_STATUS_COPYING_DATA);
-
-		ConflictWithIsolationTestingBeforeCopy();
-		CopyShardsToNode(sourceNode, targetNode, shardIntervalList, NULL);
-		ConflictWithIsolationTestingAfterCopy();
-
-		UpdatePlacementUpdateStatusForShardIntervalList(
-			shardIntervalList,
-			sourceNodeName,
-			sourceNodePort,
-			PLACEMENT_UPDATE_STATUS_CREATING_CONSTRAINTS);
-
-		foreach_declared_ptr(shardInterval, shardIntervalList)
-		{
-			List *ddlCommandList =
-				PostLoadShardCreationCommandList(shardInterval, sourceNodeName,
-												 sourceNodePort);
-			char *tableOwner = TableOwner(shardInterval->relationId);
-			SendCommandListToWorkerOutsideTransaction(targetNodeName, targetNodePort,
-													  tableOwner, ddlCommandList);
-
-			MemoryContextReset(localContext);
-		}
+		CreatePostLoadObjectsOnNode(shardIntervalList, sourceNodeName, sourceNodePort,
+									targetNodeName, targetNodePort);
 	}
 
 	/*
@@ -1605,72 +1566,181 @@ CopyShardTablesViaBlockWrites(List *shardIntervalList, char *sourceNodeName,
 	 */
 	if (!(optionFlags & SHARD_TRANSFER_NO_CREATE_RELATIONSHIPS))
 	{
+		CreateRelationshipsOnNode(shardIntervalList, sourceNodeName, sourceNodePort,
+								  targetNodeName, targetNodePort);
+	}
+	MemoryContextReset(localContext);
+	MemoryContextSwitchTo(oldContext);
+}
+
+static void
+CreateShardTablesOnNode(List *shardIntervalList, char *sourceNodeName,
+						int32 sourceNodePort, char *targetNodeName,
+						int32 targetNodePort)
+{
+	MemoryContext localContext = AllocSetContextCreate(CurrentMemoryContext,
+													   "CreateShardTablesOnNode",
+													   ALLOCSET_DEFAULT_SIZES);
+	MemoryContext oldContext = MemoryContextSwitchTo(localContext);
+
+	ShardInterval *shardInterval = NULL;
+	foreach_declared_ptr(shardInterval, shardIntervalList)
+	{
 		/*
-		 * Once all shards are copied, we can recreate relationships between shards.
-		 * Create DDL commands to Attach child tables to their parents in a partitioning hierarchy.
+		 * For each shard we first create the shard table in a separate
+		 * transaction and then we copy the data and create the indexes in a
+		 * second separate transaction. The reason we don't do both in a single
+		 * transaction is so we can see the size of the new shard growing
+		 * during the copy when we run get_rebalance_progress in another
+		 * session. If we wouldn't split these two phases up, then the table
+		 * wouldn't be visible in the session that get_rebalance_progress uses.
+		 * So get_rebalance_progress would always report its size as 0.
 		 */
-		List *shardIntervalWithDDCommandsList = NIL;
-		foreach_declared_ptr(shardInterval, shardIntervalList)
+		List *ddlCommandList = RecreateShardDDLCommandList(shardInterval,
+														   sourceNodeName,
+														   sourceNodePort);
+		char *tableOwner = TableOwner(shardInterval->relationId);
+
+		/* drop the shard we created on the target, in case of failure */
+		InsertCleanupRecordOutsideTransaction(CLEANUP_OBJECT_SHARD_PLACEMENT,
+											  ConstructQualifiedShardName(
+												  shardInterval),
+											  GroupForNode(targetNodeName,
+														   targetNodePort),
+											  CLEANUP_ON_FAILURE);
+
+		SendCommandListToWorkerOutsideTransaction(targetNodeName, targetNodePort,
+												  tableOwner, ddlCommandList);
+
+		MemoryContextReset(localContext);
+	}
+
+	MemoryContextSwitchTo(oldContext);
+}
+
+static void
+CopyShardDataToNode(List *shardIntervalList, WorkerNode *sourceNode,
+					WorkerNode *targetNode)
+{
+	UpdatePlacementUpdateStatusForShardIntervalList(
+		shardIntervalList,
+		sourceNode->workerName,
+		sourceNode->workerPort,
+		PLACEMENT_UPDATE_STATUS_COPYING_DATA);
+
+	ConflictWithIsolationTestingBeforeCopy();
+	CopyShardsToNode(sourceNode, targetNode, shardIntervalList, NULL);
+	ConflictWithIsolationTestingAfterCopy();
+}
+
+static void
+CreatePostLoadObjectsOnNode(List *shardIntervalList, char *sourceNodeName,
+							int32 sourceNodePort, char *targetNodeName,
+							int32 targetNodePort)
+{
+	MemoryContext localContext = AllocSetContextCreate(CurrentMemoryContext,
+													   "CreatePostLoadObjectsOnNode",
+													   ALLOCSET_DEFAULT_SIZES);
+	MemoryContext oldContext = MemoryContextSwitchTo(localContext);
+
+	UpdatePlacementUpdateStatusForShardIntervalList(
+		shardIntervalList,
+		sourceNodeName,
+		sourceNodePort,
+		PLACEMENT_UPDATE_STATUS_CREATING_CONSTRAINTS);
+
+	ShardInterval *shardInterval = NULL;
+	foreach_declared_ptr(shardInterval, shardIntervalList)
+	{
+		List *ddlCommandList =
+			PostLoadShardCreationCommandList(shardInterval, sourceNodeName,
+											 sourceNodePort);
+		char *tableOwner = TableOwner(shardInterval->relationId);
+		SendCommandListToWorkerOutsideTransaction(targetNodeName, targetNodePort,
+												  tableOwner, ddlCommandList);
+
+		MemoryContextReset(localContext);
+	}
+
+	MemoryContextSwitchTo(oldContext);
+}
+
+static void
+CreateRelationshipsOnNode(List *shardIntervalList, char *sourceNodeName,
+						  int32 sourceNodePort, char *targetNodeName,
+						  int32 targetNodePort)
+{
+	MemoryContext localContext = AllocSetContextCreate(CurrentMemoryContext,
+													   "CreateRelationshipsOnNode",
+													   ALLOCSET_DEFAULT_SIZES);
+	MemoryContext oldContext = MemoryContextSwitchTo(localContext);
+
+	/*
+	 * Once all shards are copied, we can recreate relationships between shards.
+	 * Create DDL commands to Attach child tables to their parents in a partitioning hierarchy.
+	 */
+	List *shardIntervalWithDDCommandsList = NIL;
+	ShardInterval *shardInterval = NULL;
+	foreach_declared_ptr(shardInterval, shardIntervalList)
+	{
+		if (PartitionTable(shardInterval->relationId))
 		{
-			if (PartitionTable(shardInterval->relationId))
-			{
-				char *attachPartitionCommand =
-					GenerateAttachShardPartitionCommand(shardInterval);
-
-				ShardCommandList *shardCommandList = CreateShardCommandList(
-					shardInterval,
-					list_make1(attachPartitionCommand));
-				shardIntervalWithDDCommandsList = lappend(shardIntervalWithDDCommandsList,
-														  shardCommandList);
-			}
-		}
-
-		UpdatePlacementUpdateStatusForShardIntervalList(
-			shardIntervalList,
-			sourceNodeName,
-			sourceNodePort,
-			PLACEMENT_UPDATE_STATUS_CREATING_FOREIGN_KEYS);
-
-		/*
-		 * Iterate through the colocated shards and create DDL commamnds
-		 * to create the foreign constraints.
-		 */
-		foreach_declared_ptr(shardInterval, shardIntervalList)
-		{
-			List *shardForeignConstraintCommandList = NIL;
-			List *referenceTableForeignConstraintList = NIL;
-
-			CopyShardForeignConstraintCommandListGrouped(shardInterval,
-														 &
-														 shardForeignConstraintCommandList,
-														 &
-														 referenceTableForeignConstraintList);
+			char *attachPartitionCommand =
+				GenerateAttachShardPartitionCommand(shardInterval);
 
 			ShardCommandList *shardCommandList = CreateShardCommandList(
 				shardInterval,
-				list_concat(shardForeignConstraintCommandList,
-							referenceTableForeignConstraintList));
+				list_make1(attachPartitionCommand));
 			shardIntervalWithDDCommandsList = lappend(shardIntervalWithDDCommandsList,
 													  shardCommandList);
 		}
-
-		/* Now execute the Partitioning & Foreign constraints creation commads. */
-		ShardCommandList *shardCommandList = NULL;
-		foreach_declared_ptr(shardCommandList, shardIntervalWithDDCommandsList)
-		{
-			char *tableOwner = TableOwner(shardCommandList->shardInterval->relationId);
-			SendCommandListToWorkerOutsideTransaction(targetNodeName, targetNodePort,
-													  tableOwner,
-													  shardCommandList->ddlCommandList);
-		}
-
-		UpdatePlacementUpdateStatusForShardIntervalList(
-			shardIntervalList,
-			sourceNodeName,
-			sourceNodePort,
-			PLACEMENT_UPDATE_STATUS_COMPLETING);
 	}
-	MemoryContextReset(localContext);
+
+	UpdatePlacementUpdateStatusForShardIntervalList(
+		shardIntervalList,
+		sourceNodeName,
+		sourceNodePort,
+		PLACEMENT_UPDATE_STATUS_CREATING_FOREIGN_KEYS);
+
+	/*
+	 * Iterate through the colocated shards and create DDL commamnds
+	 * to create the foreign constraints.
+	 */
+	foreach_declared_ptr(shardInterval, shardIntervalList)
+	{
+		List *shardForeignConstraintCommandList = NIL;
+		List *referenceTableForeignConstraintList = NIL;
+
+		CopyShardForeignConstraintCommandListGrouped(shardInterval,
+													 &
+													 shardForeignConstraintCommandList,
+													 &
+													 referenceTableForeignConstraintList);
+
+		ShardCommandList *shardCommandList = CreateShardCommandList(
+			shardInterval,
+			list_concat(shardForeignConstraintCommandList,
+						referenceTableForeignConstraintList));
+		shardIntervalWithDDCommandsList = lappend(shardIntervalWithDDCommandsList,
+												  shardCommandList);
+	}
+
+	/* Now execute the Partitioning & Foreign constraints creation commads. */
+	ShardCommandList *shardCommandList = NULL;
+	foreach_declared_ptr(shardCommandList, shardIntervalWithDDCommandsList)
+	{
+		char *tableOwner = TableOwner(shardCommandList->shardInterval->relationId);
+		SendCommandListToWorkerOutsideTransaction(targetNodeName, targetNodePort,
+												  tableOwner,
+												  shardCommandList->ddlCommandList);
+	}
+
+	UpdatePlacementUpdateStatusForShardIntervalList(
+		shardIntervalList,
+		sourceNodeName,
+		sourceNodePort,
+		PLACEMENT_UPDATE_STATUS_COMPLETING);
+
 	MemoryContextSwitchTo(oldContext);
 }
 

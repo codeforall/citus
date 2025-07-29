@@ -235,7 +235,20 @@ CitusExecutorRun(QueryDesc *queryDesc,
 			/* postgres will switch here again and will restore back on its own */
 			MemoryContextSwitchTo(oldcontext);
 
-			standard_ExecutorRun(queryDesc, direction, count, execute_once);
+			#if PG_VERSION_NUM >= PG_VERSION_18
+
+			/* PG18+ drops the “execute_once” argument */
+			standard_ExecutorRun(queryDesc,
+								 direction,
+								 count);
+		#else
+
+			/* PG17-: original four-arg signature */
+			standard_ExecutorRun(queryDesc,
+								 direction,
+								 count,
+								 execute_once);
+		#endif
 		}
 
 		if (totalTime)
@@ -688,15 +701,39 @@ ExecutePlanIntoDestReceiver(PlannedStmt *queryPlan, ParamListInfo params,
 	/* don't display the portal in pg_cursors, it is for internal use only */
 	portal->visible = false;
 
-	PortalDefineQuery(portal,
-					  NULL,
-					  "",
-					  CMDTAG_SELECT,
-					  list_make1(queryPlan),
-					  NULL);
+	PortalDefineQuery(
+		portal,
+		NULL,                 /* no prepared statement name */
+		"",                   /* query text */
+		CMDTAG_SELECT,        /* command tag */
+		list_make1(queryPlan),/* list of PlannedStmt* */
+		NULL                  /* no CachedPlan */
+		);
 
 	PortalStart(portal, params, eflags, GetActiveSnapshot());
-	PortalRun(portal, count, false, true, dest, dest, NULL);
+
+
+#if PG_VERSION_NUM >= PG_VERSION_18
+
+/* PG 18+: six-arg signature (drop the run_once bool) */
+	PortalRun(portal,
+			  count,  /* how many rows to fetch */
+			  false,  /* isTopLevel */
+			  dest,   /* DestReceiver *dest */
+			  dest,   /* DestReceiver *altdest */
+			  NULL);  /* QueryCompletion *qc */
+#else
+
+/* PG 17-: original seven-arg signature */
+	PortalRun(portal,
+			  count,  /* how many rows to fetch */
+			  false,  /* isTopLevel */
+			  true,   /* run_once */
+			  dest,   /* DestReceiver *dest */
+			  dest,   /* DestReceiver *altdest */
+			  NULL);  /* QueryCompletion *qc */
+#endif
+
 	PortalDrop(portal, false);
 }
 

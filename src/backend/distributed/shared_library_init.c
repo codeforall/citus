@@ -212,9 +212,11 @@ static const char * MaxSharedPoolSizeGucShowHook(void);
 static const char * LocalPoolSizeGucShowHook(void);
 static bool StatisticsCollectionGucCheckHook(bool *newval, void **extra, GucSource
 											 source);
+static bool WarnIfLocalExecutionDisabled(bool *newval, void **extra, GucSource source);
 static void CitusAuthHook(Port *port, int status);
 static bool IsSuperuser(char *userName);
 static void AdjustDynamicLibraryPathForCdcDecoders(void);
+static void EnableChangeDataCaptureAssignHook(bool newval, void *extra);
 
 static ClientAuthentication_hook_type original_client_auth_hook = NULL;
 static emit_log_hook_type original_emit_log_hook = NULL;
@@ -383,6 +385,32 @@ static const struct config_enum_entry metadata_sync_mode_options[] = {
 /* *INDENT-ON* */
 
 
+/*----------------------------------------------------------------------*
+* On PG 18+ the hook signature changed; we wrap the old Citus handler
+* in a fresh function that matches the new typedef exactly.
+*----------------------------------------------------------------------*/
+static void
+citus_executor_run_adapter(QueryDesc *queryDesc,
+						   ScanDirection direction,
+						   uint64 count
+#if PG_VERSION_NUM < PG_VERSION_18
+						   , bool run_once
+#endif
+						   )
+{
+	/* PG18+ has no run_once flag */
+	CitusExecutorRun(queryDesc,
+					 direction,
+					 count,
+#if PG_VERSION_NUM >= PG_VERSION_18
+					 true
+#else
+					 run_once
+#endif
+					 );
+}
+
+
 /* shared library initialization function */
 void
 _PG_init(void)
@@ -458,7 +486,7 @@ _PG_init(void)
 	get_relation_info_hook = multi_get_relation_info_hook;
 	set_join_pathlist_hook = multi_join_restriction_hook;
 	ExecutorStart_hook = CitusExecutorStart;
-	ExecutorRun_hook = CitusExecutorRun;
+	ExecutorRun_hook = citus_executor_run_adapter;
 	ExplainOneQuery_hook = CitusExplainOneQuery;
 	prev_ExecutorEnd = ExecutorEnd_hook;
 	ExecutorEnd_hook = CitusAttributeToEnd;
@@ -1272,7 +1300,7 @@ RegisterCitusConfigVariables(void)
 		false,
 		PGC_USERSET,
 		GUC_STANDARD,
-		NULL, NULL, NULL);
+		NULL, EnableChangeDataCaptureAssignHook, NULL);
 
 	DefineCustomBoolVariable(
 		"citus.enable_cluster_clock",
@@ -1376,6 +1404,17 @@ RegisterCitusConfigVariables(void)
 		PGC_USERSET,
 		GUC_STANDARD,
 		NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		"citus.enable_local_fast_path_query_optimization",
+		gettext_noop("Enables the planner to avoid a query deparse and planning if "
+					 "the shard is local to the current node."),
+		NULL,
+		&EnableLocalFastPathQueryOptimization,
+		true,
+		PGC_USERSET,
+		GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE,
+		WarnIfLocalExecutionDisabled, NULL, NULL);
 
 	DefineCustomBoolVariable(
 		"citus.enable_local_reference_table_foreign_keys",
@@ -2803,6 +2842,26 @@ WarnIfDeprecatedExecutorUsed(int *newval, void **extra, GucSource source)
 
 
 /*
+ * WarnIfLocalExecutionDisabled is used to emit a warning message when
+ * enabling citus.enable_local_fast_path_query_optimization if
+ * citus.enable_local_execution was disabled.
+ */
+static bool
+WarnIfLocalExecutionDisabled(bool *newval, void **extra, GucSource source)
+{
+	if (*newval == true && EnableLocalExecution == false)
+	{
+		ereport(WARNING, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						  errmsg(
+							  "citus.enable_local_execution must be set in order for "
+							  "citus.enable_local_fast_path_query_optimization to be effective.")));
+	}
+
+	return true;
+}
+
+
+/*
  * NoticeIfSubqueryPushdownEnabled prints a notice when a user sets
  * citus.subquery_pushdown to ON. It doesn't print the notice if the
  * value is already true.
@@ -3270,5 +3329,21 @@ CitusObjectAccessHook(ObjectAccessType access, Oid classId, Oid objectId, int su
 		 * the provided objectId with extension oid so we will set the value
 		 * regardless if it's citus being created */
 		SetCreateCitusTransactionLevel(GetCurrentTransactionNestLevel());
+	}
+}
+
+
+/*
+ * EnableChangeDataCaptureAssignHook is called whenever the
+ * citus.enable_change_data_capture setting is changed to dynamically
+ * adjust the dynamic_library_path based on the new value.
+ */
+static void
+EnableChangeDataCaptureAssignHook(bool newval, void *extra)
+{
+	if (newval)
+	{
+		/* CDC enabled: add citus_decoders to the path */
+		AdjustDynamicLibraryPathForCdcDecoders();
 	}
 }

@@ -485,10 +485,14 @@ ScheduleTasksToParallelCopyReferenceTablesOnAllMissingNodes(int64 jobId, char tr
 			 * create the shard relationships will result in ERROR.
 			 */
 			uint32 shardTransferFlags = SHARD_TRANSFER_SINGLE_SHARD_ONLY |
-										SHARD_TRANSFER_NO_CREATE_RELATIONSHIPS;
+										SHARD_TRANSFER_SKIP_CREATE_RELATIONSHIPS;
+			appendStringInfo(&buf,
+								"SET LOCAL application_name TO '%s%ld';\n",
+								CITUS_REBALANCER_APPLICATION_NAME_PREFIX,
+								GetGlobalPID());
 
 			appendStringInfo(&buf,
-								"SELECT pg_catalog.citus_copy_one_shard_placement(%ld,%u,%u,%u,%s)",
+								"SELECT citus_internal.citus_internal_copy_single_shard_placement(%ld,%u,%u,%u,%s)",
 								shardId,
 								sourceShardPlacement->nodeId,
 								newWorkerNode->nodeId,
@@ -528,9 +532,14 @@ ScheduleTasksToParallelCopyReferenceTablesOnAllMissingNodes(int64 jobId, char tr
 			}
 			resetStringInfo(&buf);
 			uint32 shardTransferFlags = SHARD_TRANSFER_CREATE_RELATIONSHIPS_ONLY;
+			/* Temporary hack until we get background task config support PR */
+			appendStringInfo(&buf,
+								"SET LOCAL application_name TO '%s%ld';\n",
+								CITUS_REBALANCER_APPLICATION_NAME_PREFIX,
+								GetGlobalPID());
 
 			appendStringInfo(&buf,
-								"SELECT pg_catalog.citus_copy_one_shard_placement(%ld,%u,%u,%u,%s)",
+								"SELECT citus_internal.citus_internal_copy_single_shard_placement(%ld,%u,%u,%u,%s)",
 								shardId,
 								sourceShardPlacement->nodeId,
 								newWorkerNode->nodeId,

@@ -52,7 +52,7 @@ typedef enum
 	 * we want to avoid the creation of the relationships on the source node
 	 * until all the shards are transfered.
 	 */
-	SHARD_TRANSFER_NO_CREATE_RELATIONSHIPS = 1 << 1,
+	SHARD_TRANSFER_SKIP_CREATE_RELATIONSHIPS = 1 << 1,
 
 	/* This flag is used to indicate that the shard transfer function should
 	 * only create the relationships on the target node and not transfer any data.

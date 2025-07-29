@@ -176,8 +176,7 @@ PG_FUNCTION_INFO_V1(master_copy_shard_placement);
 PG_FUNCTION_INFO_V1(citus_move_shard_placement);
 PG_FUNCTION_INFO_V1(citus_move_shard_placement_with_nodeid);
 PG_FUNCTION_INFO_V1(master_move_shard_placement);
-PG_FUNCTION_INFO_V1(citus_copy_one_shard_placement);
-
+PG_FUNCTION_INFO_V1(citus_internal_copy_single_shard_placement);
 double DesiredPercentFreeAfterMove = 10;
 bool CheckAvailableSpaceBeforeMove = true;
 
@@ -278,10 +277,26 @@ master_copy_shard_placement(PG_FUNCTION_ARGS)
 
 
 /*
- * master_copy_shard_placement is a wrapper function for old UDF name.
+ * citus_internal_copy_single_shard_placement is an internal function that
+ * copies a single shard placement from a source node to a target node.
+ * It has two main differences from citus_copy_shard_placement:
+ * 1. it copies only a single shard placement, not all colocated shards
+ * 2. It allows to defer the constraints creation and this same function
+ *   can be used to create the constraints later.
+ *
+ * The primary use case for this function is to transfer the shards of
+ * reference tables. Since all reference tables are colocated together,
+ * and each reference table has only one shard, this function can be used
+ * to transfer the shards of reference tables in parallel.
+ * Furthermore, the reference tables could have relations with
+ * other reference tables, so we need to ensure that their constraints
+ * are also transferred after copying the shards to the target node.
+ * For this reason, we allow the caller to defer the constraints creation.
+
+ * This function is not supposed to be called by the user directly.
  */
 Datum
-citus_copy_one_shard_placement(PG_FUNCTION_ARGS)
+citus_internal_copy_single_shard_placement(PG_FUNCTION_ARGS)
 {
 	CheckCitusVersion(ERROR);
 	EnsureCoordinator();
@@ -297,6 +312,17 @@ citus_copy_one_shard_placement(PG_FUNCTION_ARGS)
 	WorkerNode *targetNode = FindNodeWithNodeId(targetNodeId, missingOk);
 
 	char shardReplicationMode = LookupShardTransferMode(shardReplicationModeOid);
+
+	/*
+	 * This is an internal function that is used by the rebalancer.
+	 * It is not supposed to be called by the user directly.
+	 */
+	if (!IsRebalancerInternalBackend())
+	{
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						errmsg("This is an internal Citus function can only be "
+							   "used in by a rebalancer task")));
+	}
 
 	TransferShards(shardId, sourceNode->workerName, sourceNode->workerPort,
 				   targetNode->workerName, targetNode->workerPort,
@@ -423,7 +449,7 @@ TransferShards(int64 shardId, char *sourceNodeName,
 	List *colocatedShardList;
 
 	/*
-	 * If SHARD_TRANSFER_SINGLE_SHARD_ONLY is set, we only transfer the shard
+	 * If SHARD_TRANSFER_SINGLE_SHARD_ONLY is set, we only transfer a single shard
 	 * specified by shardId. Otherwise, we transfer all colocated shards.
 	 */
 	if (optionFlags & SHARD_TRANSFER_SINGLE_SHARD_ONLY)
@@ -1533,12 +1559,13 @@ CopyShardTablesViaBlockWrites(List *shardIntervalList, char *sourceNodeName,
 	WorkerNode *targetNode = FindWorkerNode(targetNodeName, targetNodePort);
 	ShardInterval *shardInterval = NULL;
 
+	bool createRelationshipsOnly = (optionFlags & SHARD_TRANSFER_CREATE_RELATIONSHIPS_ONLY);
 	/*
 	 * If we’re only asked to create the relationships, the shards are already
 	 * present and populated on the node. Skip the table‑setup and data‑loading
 	 * steps and proceed straight to creating the relationships.
 	 */
-	if (!(optionFlags & SHARD_TRANSFER_CREATE_RELATIONSHIPS_ONLY))
+	if (!createRelationshipsOnly)
 	{
 		/* iterate through the colocated shards and copy each */
 		foreach_declared_ptr(shardInterval, shardIntervalList)
@@ -1603,7 +1630,9 @@ CopyShardTablesViaBlockWrites(List *shardIntervalList, char *sourceNodeName,
 	 * Skip creating shard relationships if the caller has requested that they
 	 * not be created.
 	 */
-	if (!(optionFlags & SHARD_TRANSFER_NO_CREATE_RELATIONSHIPS))
+	bool skipRelationshipCreation = (optionFlags & SHARD_TRANSFER_SKIP_CREATE_RELATIONSHIPS);
+
+	if (!skipRelationshipCreation)
 	{
 		/*
 		 * Once all shards are copied, we can recreate relationships between shards.

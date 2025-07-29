@@ -27,6 +27,7 @@
 #include "distributed/citus_nodes.h"
 #include "distributed/connection_management.h"
 #include "distributed/errormessage.h"
+#include "distributed/jsonb.h"
 #include "distributed/relay_utility.h"
 #include "distributed/worker_manager.h"
 
@@ -291,6 +292,7 @@ typedef struct BackgroundTask
 	TimestampTz *not_before;
 	char *message;
 	List *nodesInvolved;
+	Jsonb *jobConfig;
 
 	/* extra space to store values for nullable value types above */
 	struct
@@ -447,7 +449,9 @@ extern BackgroundTask * ScheduleBackgroundTask(int64 jobId, Oid owner, char *com
 											   int dependingTaskCount,
 											   int64 dependingTaskIds[],
 											   int nodesInvolvedCount,
-											   int32 nodesInvolved[]);
+												int32 nodesInvolved[],
+												JobConfigOption *jobConfigOptions,
+												int jobConfigOptionCount);
 extern BackgroundTask * GetRunnableBackgroundTask(void);
 extern void ResetRunningBackgroundTasks(void);
 extern BackgroundJob * GetBackgroundJobByJobId(int64 jobId);

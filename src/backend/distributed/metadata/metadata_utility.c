@@ -67,6 +67,8 @@
 #include "distributed/pg_dist_background_task.h"
 #include "distributed/pg_dist_backrgound_task_depend.h"
 #include "distributed/pg_dist_colocation.h"
+#include "utils/jsonb.h"
+#include "distributed/jsonb.h"
 #include "distributed/pg_dist_partition.h"
 #include "distributed/pg_dist_placement.h"
 #include "distributed/pg_dist_shard.h"
@@ -3073,7 +3075,8 @@ CreateBackgroundJob(const char *jobType, const char *description)
 BackgroundTask *
 ScheduleBackgroundTask(int64 jobId, Oid owner, char *command, int dependingTaskCount,
 					   int64 dependingTaskIds[], int nodesInvolvedCount, int32
-					   nodesInvolved[])
+					   nodesInvolved[], JobConfigOption *jobConfigOptions,
+					   int jobConfigOptionCount)
 {
 	BackgroundTask *task = NULL;
 
@@ -3151,6 +3154,15 @@ ScheduleBackgroundTask(int64 jobId, Oid owner, char *command, int dependingTaskC
 			IntArrayToDatum(nodesInvolvedCount, nodesInvolved);
 		nulls[Anum_pg_dist_background_task_nodes_involved - 1] = (nodesInvolvedCount ==
 																  0);
+
+		if (jobConfigOptionCount > 0)
+		{
+			Jsonb *jobConfig = JobConfigOptionArrayToJsonb(jobConfigOptions,
+														   jobConfigOptionCount);
+			values[Anum_pg_dist_background_task_job_config - 1] =
+				JsonbGetDatum(jobConfig);
+			nulls[Anum_pg_dist_background_task_job_config - 1] = false;
+		}
 
 		HeapTuple newTuple = heap_form_tuple(RelationGetDescr(pgDistBackgroundTask),
 											 values, nulls);
@@ -3468,6 +3480,11 @@ DeformBackgroundTaskHeapTuple(TupleDesc tupleDescriptor, HeapTuple taskTuple)
 		ArrayType *nodesInvolvedArrayObject =
 			DatumGetArrayTypeP(values[Anum_pg_dist_background_task_nodes_involved - 1]);
 		task->nodesInvolved = IntegerArrayTypeToList(nodesInvolvedArrayObject);
+	}
+
+	if (!nulls[Anum_pg_dist_background_task_job_config - 1])
+	{
+		task->jobConfig = DatumGetJsonb(values[Anum_pg_dist_background_task_job_config - 1]);
 	}
 
 	return task;

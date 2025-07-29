@@ -49,6 +49,7 @@
 #include "utils/fmgrprotos.h"
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
+#include "utils/jsonb.h"
 #include "utils/portal.h"
 #include "utils/ps_status.h"
 #include "utils/resowner.h"
@@ -74,7 +75,8 @@
 #define CITUS_BACKGROUND_TASK_KEY_QUEUE 3
 #define CITUS_BACKGROUND_TASK_KEY_TASK_ID 4
 #define CITUS_BACKGROUND_TASK_KEY_JOB_ID 5
-#define CITUS_BACKGROUND_TASK_NKEYS 6
+#define CITUS_BACKGROUND_TASK_KEY_JOB_CONFIG 6
+#define CITUS_BACKGROUND_TASK_NKEYS 7
 
 static BackgroundWorkerHandle * StartCitusBackgroundTaskExecutor(char *database,
 																 char *user,
@@ -563,9 +565,17 @@ AssignRunnableTaskToNewExecutor(BackgroundTask *runnableTask,
 	/* try to create new executor and make it alive during queue monitor lifetime */
 	MemoryContext oldContext = MemoryContextSwitchTo(queueMonitorExecutionContext->ctx);
 	dsm_segment *seg = NULL;
+	char *jobConfigString = NULL;
+	if (runnableTask->jobConfig != NULL)
+	{
+		jobConfigString = JsonbToCString(NULL, &runnableTask->jobConfig->root,
+										 VARSIZE(runnableTask->jobConfig));
+	}
+
 	BackgroundWorkerHandle *handle =
 		StartCitusBackgroundTaskExecutor(databaseName, userName, runnableTask->command,
-										 runnableTask->taskid, runnableTask->jobid, &seg);
+										 runnableTask->taskid, runnableTask->jobid,
+										 jobConfigString, &seg);
 	MemoryContextSwitchTo(oldContext);
 
 	if (NewExecutorExceedsPgMaxWorkers(handle, queueMonitorExecutionContext))
@@ -1576,7 +1586,7 @@ ConsumeTaskWorkerOutput(shm_mq_handle *responseq, StringInfo message, bool *hadE
  */
 static dsm_segment *
 StoreArgumentsInDSM(char *database, char *username, char *command,
-					int64 taskId, int64 jobId)
+					int64 taskId, int64 jobId, char *jobConfig)
 {
 	/*
 	 * Create the shared memory that we will pass to the background
@@ -1593,6 +1603,10 @@ StoreArgumentsInDSM(char *database, char *username, char *command,
 	shm_toc_estimate_chunk(&e, QUEUE_SIZE);
 	shm_toc_estimate_chunk(&e, sizeof(int64));
 	shm_toc_estimate_chunk(&e, sizeof(int64));
+	if (jobConfig != NULL)
+	{
+		shm_toc_estimate_chunk(&e, strlen(jobConfig) + 1);
+	}
 	shm_toc_estimate_keys(&e, CITUS_BACKGROUND_TASK_NKEYS);
 	Size segsize = shm_toc_estimate(&e);
 
@@ -1636,6 +1650,14 @@ StoreArgumentsInDSM(char *database, char *username, char *command,
 	*jobIdTarget = jobId;
 	shm_toc_insert(toc, CITUS_BACKGROUND_TASK_KEY_JOB_ID, jobIdTarget);
 
+	if (jobConfig != NULL)
+	{
+		size = strlen(jobConfig) + 1;
+		char *jobConfigTarget = shm_toc_allocate(toc, size);
+		strcpy_s(jobConfigTarget, size, jobConfig);
+		shm_toc_insert(toc, CITUS_BACKGROUND_TASK_KEY_JOB_CONFIG, jobConfigTarget);
+	}
+
 	shm_mq_attach(mq, seg, NULL);
 
 	/*
@@ -1657,9 +1679,11 @@ StoreArgumentsInDSM(char *database, char *username, char *command,
  */
 static BackgroundWorkerHandle *
 StartCitusBackgroundTaskExecutor(char *database, char *user, char *command,
-								 int64 taskId, int64 jobId, dsm_segment **pSegment)
+								 int64 taskId, int64 jobId, char *jobConfig,
+								 dsm_segment **pSegment)
 {
-	dsm_segment *seg = StoreArgumentsInDSM(database, user, command, taskId, jobId);
+	dsm_segment *seg = StoreArgumentsInDSM(database, user, command, taskId, jobId,
+										   jobConfig);
 
 	/* Configure a worker. */
 	BackgroundWorker worker = { 0 };
@@ -1760,6 +1784,7 @@ CitusBackgroundTaskExecutor(Datum main_arg)
 	char *command = shm_toc_lookup(toc, CITUS_BACKGROUND_TASK_KEY_COMMAND, false);
 	int64 *taskId = shm_toc_lookup(toc, CITUS_BACKGROUND_TASK_KEY_TASK_ID, false);
 	int64 *jobId = shm_toc_lookup(toc, CITUS_BACKGROUND_TASK_KEY_JOB_ID, false);
+	char *jobConfig = shm_toc_lookup(toc, CITUS_BACKGROUND_TASK_KEY_JOB_CONFIG, true);
 	shm_mq *mq = shm_toc_lookup(toc, CITUS_BACKGROUND_TASK_KEY_QUEUE, false);
 
 	shm_mq_set_sender(mq, MyProc);
@@ -1798,6 +1823,27 @@ CitusBackgroundTaskExecutor(Datum main_arg)
 
 	/* Execute the query. */
 	StartTransactionCommand();
+
+	if (jobConfig != NULL)
+	{
+		Jsonb *config = DatumGetJsonb(DirectFunctionCall1(jsonb_in, CStringGetDatum(jobConfig)));
+		JsonbIterator *iterator = JsonbIteratorInit(&config->root);
+		JsonbValue value;
+		JsonbIteratorToken token;
+
+		while ((token = JsonbIteratorNext(&iterator, &value, false)) != WJB_DONE)
+		{
+			if (token == WJB_ELEM)
+			{
+				JsonbValue *name = getIJsonbValueFromContainer(&value.val.array.children[0]);
+				JsonbValue *val = getIJsonbValueFromContainer(&value.val.array.children[1]);
+				JsonbValue *is_local = getIJsonbValueFromContainer(&value.val.array.children[2]);
+
+				SetPGVariable(NameStr(name->val.string), list_make1(makeString(NameStr(val->val.string))), is_local->val.boolean);
+			}
+		}
+	}
+
 	ExecuteSqlString(command);
 	CommitTransactionCommand();
 

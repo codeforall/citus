@@ -45,8 +45,6 @@
 
 
 /* local function forward declarations */
-static List * TopologicallySortReferenceTables(List *referenceTableIdList);
-static void BuildForeignKeyGraph(List *referenceTableIdList, HTAB *graph, HTAB *inDegree);
 static List * WorkersWithoutReferenceTablePlacement(uint64 shardId, LOCKMODE lockMode);
 static StringInfo CopyShardPlacementToWorkerNodeQuery(
 	ShardPlacement *sourceShardPlacement,
@@ -454,9 +452,6 @@ ScheduleTasksToParallelCopyReferenceTablesOnAllMissingNodes(int64 jobId, char tr
 	List *depTasksList = NIL;
 	const char *transferModeString = "block_writes"; /*For now we only support block writes*/
 
-	List *sortedReferenceTableIdList = TopologicallySortReferenceTables(
-		referenceTableIdList);
-
 	HTAB *scheduledShardMoves = hash_create("Scheduled Shard Moves", 16,
 											&(HASHCTL){ .keysize = sizeof(uint64),
 														.entrysize = sizeof(bool) },
@@ -471,12 +466,12 @@ ScheduleTasksToParallelCopyReferenceTablesOnAllMissingNodes(int64 jobId, char tr
 		Oid relationId = InvalidOid;
 		List *nodeTasksList = NIL;
 		HTAB *shardTaskMap = hash_create("Shard Task Map",
-										 list_length(sortedReferenceTableIdList),
+										 list_length(referenceTableIdList),
 										 &(HASHCTL){ .keysize = sizeof(uint64),
 													 .entrysize = sizeof(int64) },
 										 HASH_ELEM);
 
-		foreach_declared_oid(relationId, sortedReferenceTableIdList)
+		foreach_declared_oid(relationId, referenceTableIdList)
 		{
 			referenceTableName = get_rel_name(relationId);
 			List *shardIntervalList = LoadShardIntervalList(relationId);
@@ -516,25 +511,26 @@ ScheduleTasksToParallelCopyReferenceTablesOnAllMissingNodes(int64 jobId, char tr
 							newWorkerNode->workerPort, buf.data)));
 
 			CitusTableCacheEntry *cacheEntry = GetCitusTableCacheEntry(relationId);
-			List *referencedRelations = cacheEntry->referencedRelationsViaForeignKey;
+			List *relatedRelations = list_concat(cacheEntry->referencedRelationsViaForeignKey,
+												 cacheEntry->referencingRelationsViaForeignKey);
 			List *dependencyTaskList = NIL;
 
-			Oid referencedRelationId = InvalidOid;
-			foreach_declared_oid(referencedRelationId, referencedRelations)
+			Oid relatedRelationId = InvalidOid;
+			foreach_declared_oid(relatedRelationId, relatedRelations)
 			{
-				if (!list_member_oid(sortedReferenceTableIdList, referencedRelationId))
+				if (!list_member_oid(referenceTableIdList, relatedRelationId))
 				{
 					continue;
 				}
 
-				List *referencedShardIntervalList = LoadShardIntervalList(
-					referencedRelationId);
-				ShardInterval *referencedShardInterval = (ShardInterval *) linitial(
-					referencedShardIntervalList);
-				uint64 referencedShardId = referencedShardInterval->shardId;
+				List *relatedShardIntervalList = LoadShardIntervalList(
+					relatedRelationId);
+				ShardInterval *relatedShardInterval = (ShardInterval *) linitial(
+					relatedShardIntervalList);
+				uint64 relatedShardId = relatedShardInterval->shardId;
 
 				bool taskFound = false;
-				int64 *taskId = hash_search(shardTaskMap, &referencedShardId,
+				int64 *taskId = hash_search(shardTaskMap, &relatedShardId,
 											HASH_FIND, &taskFound);
 				if (taskFound)
 				{
@@ -1100,135 +1096,6 @@ ErrorIfNotAllNodesHaveReferenceTableReplicas(List *workerNodeList)
  * creation logic guarantees that this reference table will be created on all the
  * nodes, so our answer was correct.
  */
-/*
- * TopologicallySortReferenceTables sorts the given list of reference tables based on
- * foreign key dependencies.
- */
-List *
-TopologicallySortReferenceTables(List *referenceTableIdList)
-{
-	List *sortedList = NIL;
-	List *queue = NIL;
-	HTAB *graph = NULL;
-	HTAB *inDegree = NULL;
-	HASHCTL ctl;
-
-	if (list_length(referenceTableIdList) <= 1)
-	{
-		return list_copy(referenceTableIdList);
-	}
-
-	memset(&ctl, 0, sizeof(ctl));
-	ctl.keysize = sizeof(Oid);
-	ctl.entrysize = sizeof(List *);
-	ctl.hcxt = CurrentMemoryContext;
-	graph = hash_create("Foreign Key Graph", list_length(referenceTableIdList),
-						&ctl, HASH_ELEM | HASH_CONTEXT);
-
-	memset(&ctl, 0, sizeof(ctl));
-	ctl.keysize = sizeof(Oid);
-	ctl.entrysize = sizeof(int);
-	ctl.hcxt = CurrentMemoryContext;
-	inDegree = hash_create("In-Degree Map", list_length(referenceTableIdList),
-						   &ctl, HASH_ELEM | HASH_CONTEXT);
-
-	BuildForeignKeyGraph(referenceTableIdList, graph, inDegree);
-
-	Oid relationId = InvalidOid;
-	foreach_declared_oid(relationId, referenceTableIdList)
-	{
-		bool found = false;
-		int *degree = hash_search(inDegree, &relationId, HASH_FIND, &found);
-		if (found && *degree == 0)
-		{
-			queue = lappend_oid(queue, relationId);
-		}
-	}
-
-	while (list_length(queue) > 0)
-	{
-		Oid currentRelationId = linitial_oid(queue);
-		queue = list_delete_first(queue);
-		sortedList = lappend_oid(sortedList, currentRelationId);
-
-		bool found = false;
-		List **dependentRelations = hash_search(graph, &currentRelationId, HASH_FIND,
-												&found);
-		if (found)
-		{
-			Oid dependentRelationId = InvalidOid;
-			foreach_declared_oid(dependentRelationId, *dependentRelations)
-			{
-				int *degree = hash_search(inDegree, &dependentRelationId, HASH_FIND,
-										  &found);
-				if (found)
-				{
-					(*degree)--;
-					if (*degree == 0)
-					{
-						queue = lappend_oid(queue, dependentRelationId);
-					}
-				}
-			}
-		}
-	}
-
-	if (list_length(sortedList) != list_length(referenceTableIdList))
-	{
-		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						errmsg("circular dependency detected among reference tables")));
-	}
-
-	hash_destroy(graph);
-	hash_destroy(inDegree);
-
-	return sortedList;
-}
-
-
-/*
- * BuildForeignKeyGraph constructs a dependency graph and calculates the in-degree
- * of each node for the given list of reference tables.
- */
-static void
-BuildForeignKeyGraph(List *referenceTableIdList, HTAB *graph, HTAB *inDegree)
-{
-	Oid relationId = InvalidOid;
-	foreach_declared_oid(relationId, referenceTableIdList)
-	{
-		bool found = false;
-		hash_search(inDegree, &relationId, HASH_ENTER, &found);
-		if (!found)
-		{
-			*(int *) hash_search(inDegree, &relationId, HASH_ENTER, &found) = 0;
-		}
-
-		CitusTableCacheEntry *cacheEntry = GetCitusTableCacheEntry(relationId);
-		List *referencedRelations = cacheEntry->referencedRelationsViaForeignKey;
-
-		Oid referencedRelationId = InvalidOid;
-		foreach_declared_oid(referencedRelationId, referencedRelations)
-		{
-			if (!list_member_oid(referenceTableIdList, referencedRelationId))
-			{
-				continue;
-			}
-
-			List **dependentRelations = hash_search(graph, &referencedRelationId,
-													HASH_ENTER, &found);
-			if (!found)
-			{
-				*dependentRelations = NIL;
-			}
-			*dependentRelations = lappend_oid(*dependentRelations, relationId);
-
-			int *degree = hash_search(inDegree, &relationId, HASH_ENTER, &found);
-			(*degree)++;
-		}
-	}
-}
-
-
 static bool
 NodeHasAllReferenceTableReplicas(WorkerNode *workerNode)
 {

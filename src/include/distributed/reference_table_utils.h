@@ -35,6 +35,5 @@ extern void DeleteAllReplicatedTablePlacementsFromNodeGroupViaMetadataContext(
 extern int CompareOids(const void *leftElement, const void *rightElement);
 extern void ReplicateAllReferenceTablesToNode(WorkerNode *workerNode);
 extern void ErrorIfNotAllNodesHaveReferenceTableReplicas(List *workerNodeList);
-extern List * TopologicallySortReferenceTables(List *referenceTableIdList);
 
 #endif /* REFERENCE_TABLE_UTILS_H_ */

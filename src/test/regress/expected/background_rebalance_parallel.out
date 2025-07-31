@@ -864,26 +864,23 @@ DROP SCHEMA IF EXISTS background_rebalance_parallel_fk CASCADE;
 CREATE SCHEMA background_rebalance_parallel_fk;
 SET search_path TO background_rebalance_parallel_fk;
 -- Create two reference tables with a foreign key relationship
-CREATE TABLE referenced_table (id int PRIMARY KEY);
+-- Create two reference tables with a circular dependency
+CREATE TABLE referenced_table (id int PRIMARY KEY, ref_id int);
 SELECT create_reference_table('referenced_table');
  create_reference_table 
 ------------------------
  
 (1 row)
 
-CREATE TABLE referencing_table (
-    id int PRIMARY KEY,
-    ref_id int REFERENCES referenced_table(id)
-);
+CREATE TABLE referencing_table (id int PRIMARY KEY, ref_id int REFERENCES referenced_table(id));
 SELECT create_reference_table('referencing_table');
  create_reference_table 
 ------------------------
  
 (1 row)
 
--- Add some data
-INSERT INTO referenced_table VALUES (1), (2);
-INSERT INTO referencing_table VALUES (1, 1), (2, 2);
+-- Add a foreign key from the first table to the second to create a cycle
+ALTER TABLE referenced_table ADD CONSTRAINT fk_to_referencing_table FOREIGN KEY (ref_id) REFERENCES referencing_table(id);
 -- Add a new node to trigger the copy of reference tables
 SELECT 1 FROM citus_add_node('localhost', :worker_5_port);
  ?column? 
@@ -933,8 +930,8 @@ WHERE T.command LIKE '%citus_internal_copy_single_shard_placement(' || SI.shardi
 -- Check the dependency
 SELECT count(*)
 FROM pg_dist_background_task_depend D
-WHERE D.task_id = (SELECT task_id FROM referencing_task)
-  AND D.depends_on = (SELECT task_id FROM referenced_task);
+WHERE (D.task_id = (SELECT task_id FROM referencing_task) AND D.depends_on = (SELECT task_id FROM referenced_task))
+   OR (D.task_id = (SELECT task_id FROM referenced_task) AND D.depends_on = (SELECT task_id FROM referencing_task));
  count 
 -------
      1

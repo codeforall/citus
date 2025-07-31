@@ -45,6 +45,8 @@
 
 
 /* local function forward declarations */
+static List * TopologicallySortReferenceTables(List *referenceTableIdList);
+static void BuildForeignKeyGraph(List *referenceTableIdList, HTAB *graph, HTAB *inDegree);
 static List * WorkersWithoutReferenceTablePlacement(uint64 shardId, LOCKMODE lockMode);
 static StringInfo CopyShardPlacementToWorkerNodeQuery(
 	ShardPlacement *sourceShardPlacement,
@@ -452,6 +454,14 @@ ScheduleTasksToParallelCopyReferenceTablesOnAllMissingNodes(int64 jobId, char tr
 	List *depTasksList = NIL;
 	const char *transferModeString = "block_writes"; /*For now we only support block writes*/
 
+	List *sortedReferenceTableIdList = TopologicallySortReferenceTables(
+		referenceTableIdList);
+
+	HTAB *scheduledShardMoves = hash_create("Scheduled Shard Moves", 16,
+											&(HASHCTL){ .keysize = sizeof(uint64),
+														.entrysize = sizeof(bool) },
+											HASH_ELEM);
+
 	foreach_declared_ptr(newWorkerNode, newWorkersList)
 	{
 		ereport(DEBUG2, (errmsg("replicating reference table '%s' to %s:%d ...",
@@ -460,12 +470,16 @@ ScheduleTasksToParallelCopyReferenceTablesOnAllMissingNodes(int64 jobId, char tr
 
 		Oid relationId = InvalidOid;
 		List *nodeTasksList = NIL;
+		HTAB *shardTaskMap = hash_create("Shard Task Map",
+										 list_length(sortedReferenceTableIdList),
+										 &(HASHCTL){ .keysize = sizeof(uint64),
+													 .entrysize = sizeof(int64) },
+										 HASH_ELEM);
 
-		foreach_declared_oid(relationId, referenceTableIdList)
+		foreach_declared_oid(relationId, sortedReferenceTableIdList)
 		{
 			referenceTableName = get_rel_name(relationId);
 			List *shardIntervalList = LoadShardIntervalList(relationId);
-			/* Reference tables are supposed to have only one shard */
 			if (list_length(shardIntervalList) != 1)
 			{
 				ereport(ERROR, (errmsg("reference table \"%s\" does not have a shard",
@@ -474,50 +488,94 @@ ScheduleTasksToParallelCopyReferenceTablesOnAllMissingNodes(int64 jobId, char tr
 			ShardInterval *shardInterval = (ShardInterval *) linitial(shardIntervalList);
 			shardId = shardInterval->shardId;
 
+			bool found = false;
+			hash_search(scheduledShardMoves, &shardId, HASH_ENTER, &found);
+			if (found)
+			{
+				continue;
+			}
+
 			resetStringInfo(&buf);
-			/*
-			 * In first step just create and load data in the shards but defer the creation
-			 * of the shard relationships to the next step.
-			 * The reason we want to defer the creation of the shard relationships is that
-			 * we want to make sure that all the parallel shard copy task are finished
-			 * before we create the relationships. Otherwise we might end up with
-			 * a situation where the dependent-shard task is still running and trying to
-			 * create the shard relationships will result in ERROR.
-			 */
 			uint32 shardTransferFlags = SHARD_TRANSFER_SINGLE_SHARD_ONLY |
 										SHARD_TRANSFER_SKIP_CREATE_RELATIONSHIPS;
 			appendStringInfo(&buf,
-								"SET LOCAL application_name TO '%s%ld';\n",
-								CITUS_REBALANCER_APPLICATION_NAME_PREFIX,
-								GetGlobalPID());
-
+							 "SET LOCAL application_name TO '%s%ld';\n",
+							 CITUS_REBALANCER_APPLICATION_NAME_PREFIX,
+							 GetGlobalPID());
 			appendStringInfo(&buf,
-								"SELECT citus_internal.citus_internal_copy_single_shard_placement(%ld,%u,%u,%u,%s)",
-								shardId,
-								sourceShardPlacement->nodeId,
-								newWorkerNode->nodeId,
-								shardTransferFlags,
-								quote_literal_cstr(transferModeString));
+							 "SELECT citus_internal.citus_internal_copy_single_shard_placement(%ld,%u,%u,%u,%s)",
+							 shardId,
+							 sourceShardPlacement->nodeId,
+							 newWorkerNode->nodeId,
+							 shardTransferFlags,
+							 quote_literal_cstr(transferModeString));
 
 			ereport(DEBUG2,
 					(errmsg("replicating reference table '%s' to %s:%d ... QUERY= %s",
 							referenceTableName, newWorkerNode->workerName,
-							newWorkerNode->workerPort,buf.data)));
+							newWorkerNode->workerPort, buf.data)));
 
-			int nDepends = 0;
+			CitusTableCacheEntry *cacheEntry = GetCitusTableCacheEntry(relationId);
+			List *referencedRelations = cacheEntry->referencedRelationsViaForeignKey;
+			List *dependencyTaskList = NIL;
+
+			Oid referencedRelationId = InvalidOid;
+			foreach_declared_oid(referencedRelationId, referencedRelations)
+			{
+				if (!list_member_oid(sortedReferenceTableIdList, referencedRelationId))
+				{
+					continue;
+				}
+
+				List *referencedShardIntervalList = LoadShardIntervalList(
+					referencedRelationId);
+				ShardInterval *referencedShardInterval = (ShardInterval *) linitial(
+					referencedShardIntervalList);
+				uint64 referencedShardId = referencedShardInterval->shardId;
+
+				bool taskFound = false;
+				int64 *taskId = hash_search(shardTaskMap, &referencedShardId,
+											HASH_FIND, &taskFound);
+				if (taskFound)
+				{
+					dependencyTaskList = lappend_int64(dependencyTaskList, *taskId);
+				}
+			}
+
+			int nDepends = list_length(dependencyTaskList);
 			int64 *dependsArray = NULL;
+			if (nDepends > 0)
+			{
+				dependsArray = (int64 *) palloc(sizeof(int64) * nDepends);
+				int i = 0;
+				ListCell *lc;
+				foreach(lc, dependencyTaskList)
+				{
+					dependsArray[i++] = lfirst_int64(lc);
+				}
+			}
+
 			int32 nodesInvolved[2] = { 0 };
 			nodesInvolved[0] = sourceShardPlacement->nodeId;
 			nodesInvolved[1] = newWorkerNode->nodeId;
 
 			task = ScheduleBackgroundTask(jobId, CitusExtensionOwner(), buf.data,
-														  nDepends,
-														  dependsArray, 2,
-														  nodesInvolved);
+										  nDepends,
+										  dependsArray, 2,
+										  nodesInvolved);
 
-			nodeTasksList = lappend(nodeTasksList,task);
+			hash_search(shardTaskMap, &shardId, HASH_ENTER, &found);
+			*(int64 *) hash_search(shardTaskMap, &shardId, HASH_ENTER,
+								   &found) = task->taskid;
+
+			nodeTasksList = lappend(nodeTasksList, task);
+			if (dependsArray)
+			{
+				pfree(dependsArray);
+			}
+			list_free(dependencyTaskList);
 		}
-		/* Create a task to create reference table relations on this node */
+
 		if (list_length(nodeTasksList) > 0)
 		{
 			int nDepends = list_length(nodeTasksList);
@@ -532,29 +590,28 @@ ScheduleTasksToParallelCopyReferenceTablesOnAllMissingNodes(int64 jobId, char tr
 			}
 			resetStringInfo(&buf);
 			uint32 shardTransferFlags = SHARD_TRANSFER_CREATE_RELATIONSHIPS_ONLY;
-			/* Temporary hack until we get background task config support PR */
 			appendStringInfo(&buf,
-								"SET LOCAL application_name TO '%s%ld';\n",
-								CITUS_REBALANCER_APPLICATION_NAME_PREFIX,
-								GetGlobalPID());
-
+							 "SET LOCAL application_name TO '%s%ld';\n",
+							 CITUS_REBALANCER_APPLICATION_NAME_PREFIX,
+							 GetGlobalPID());
 			appendStringInfo(&buf,
-								"SELECT citus_internal.citus_internal_copy_single_shard_placement(%ld,%u,%u,%u,%s)",
-								shardId,
-								sourceShardPlacement->nodeId,
-								newWorkerNode->nodeId,
-								shardTransferFlags,
-								quote_literal_cstr(transferModeString));
+							 "SELECT citus_internal.citus_internal_copy_single_shard_placement(%ld,%u,%u,%u,%s)",
+							 shardId,
+							 sourceShardPlacement->nodeId,
+							 newWorkerNode->nodeId,
+							 shardTransferFlags,
+							 quote_literal_cstr(transferModeString));
 
 			ereport(DEBUG2,
-					(errmsg("creating relations for reference table '%s' on %s:%d ... QUERY= %s",
-							referenceTableName, newWorkerNode->workerName,
-							newWorkerNode->workerPort,buf.data)));
+					(errmsg(
+						"creating relations for reference table '%s' on %s:%d ... QUERY= %s",
+						referenceTableName, newWorkerNode->workerName,
+						newWorkerNode->workerPort, buf.data)));
 
 			task = ScheduleBackgroundTask(jobId, CitusExtensionOwner(), buf.data,
-							nDepends,
-							dependsArray, 2,
-							nodesInvolved);
+										  nDepends,
+										  dependsArray, 2,
+										  nodesInvolved);
 
 			depTasksList = lappend(depTasksList, task);
 
@@ -562,7 +619,10 @@ ScheduleTasksToParallelCopyReferenceTablesOnAllMissingNodes(int64 jobId, char tr
 			list_free(nodeTasksList);
 			nodeTasksList = NIL;
 		}
+
+		hash_destroy(shardTaskMap);
 	}
+	hash_destroy(scheduledShardMoves);
 
 	/*
 	 * compute a dependent task list array to be used to indicate the completion of all
@@ -1040,6 +1100,135 @@ ErrorIfNotAllNodesHaveReferenceTableReplicas(List *workerNodeList)
  * creation logic guarantees that this reference table will be created on all the
  * nodes, so our answer was correct.
  */
+/*
+ * TopologicallySortReferenceTables sorts the given list of reference tables based on
+ * foreign key dependencies.
+ */
+List *
+TopologicallySortReferenceTables(List *referenceTableIdList)
+{
+	List *sortedList = NIL;
+	List *queue = NIL;
+	HTAB *graph = NULL;
+	HTAB *inDegree = NULL;
+	HASHCTL ctl;
+
+	if (list_length(referenceTableIdList) <= 1)
+	{
+		return list_copy(referenceTableIdList);
+	}
+
+	memset(&ctl, 0, sizeof(ctl));
+	ctl.keysize = sizeof(Oid);
+	ctl.entrysize = sizeof(List *);
+	ctl.hcxt = CurrentMemoryContext;
+	graph = hash_create("Foreign Key Graph", list_length(referenceTableIdList),
+						&ctl, HASH_ELEM | HASH_CONTEXT);
+
+	memset(&ctl, 0, sizeof(ctl));
+	ctl.keysize = sizeof(Oid);
+	ctl.entrysize = sizeof(int);
+	ctl.hcxt = CurrentMemoryContext;
+	inDegree = hash_create("In-Degree Map", list_length(referenceTableIdList),
+						   &ctl, HASH_ELEM | HASH_CONTEXT);
+
+	BuildForeignKeyGraph(referenceTableIdList, graph, inDegree);
+
+	Oid relationId = InvalidOid;
+	foreach_declared_oid(relationId, referenceTableIdList)
+	{
+		bool found = false;
+		int *degree = hash_search(inDegree, &relationId, HASH_FIND, &found);
+		if (found && *degree == 0)
+		{
+			queue = lappend_oid(queue, relationId);
+		}
+	}
+
+	while (list_length(queue) > 0)
+	{
+		Oid currentRelationId = linitial_oid(queue);
+		queue = list_delete_first(queue);
+		sortedList = lappend_oid(sortedList, currentRelationId);
+
+		bool found = false;
+		List **dependentRelations = hash_search(graph, &currentRelationId, HASH_FIND,
+												&found);
+		if (found)
+		{
+			Oid dependentRelationId = InvalidOid;
+			foreach_declared_oid(dependentRelationId, *dependentRelations)
+			{
+				int *degree = hash_search(inDegree, &dependentRelationId, HASH_FIND,
+										  &found);
+				if (found)
+				{
+					(*degree)--;
+					if (*degree == 0)
+					{
+						queue = lappend_oid(queue, dependentRelationId);
+					}
+				}
+			}
+		}
+	}
+
+	if (list_length(sortedList) != list_length(referenceTableIdList))
+	{
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("circular dependency detected among reference tables")));
+	}
+
+	hash_destroy(graph);
+	hash_destroy(inDegree);
+
+	return sortedList;
+}
+
+
+/*
+ * BuildForeignKeyGraph constructs a dependency graph and calculates the in-degree
+ * of each node for the given list of reference tables.
+ */
+static void
+BuildForeignKeyGraph(List *referenceTableIdList, HTAB *graph, HTAB *inDegree)
+{
+	Oid relationId = InvalidOid;
+	foreach_declared_oid(relationId, referenceTableIdList)
+	{
+		bool found = false;
+		hash_search(inDegree, &relationId, HASH_ENTER, &found);
+		if (!found)
+		{
+			*(int *) hash_search(inDegree, &relationId, HASH_ENTER, &found) = 0;
+		}
+
+		CitusTableCacheEntry *cacheEntry = GetCitusTableCacheEntry(relationId);
+		List *referencedRelations = cacheEntry->referencedRelationsViaForeignKey;
+
+		Oid referencedRelationId = InvalidOid;
+		foreach_declared_oid(referencedRelationId, referencedRelations)
+		{
+			if (!list_member_oid(referenceTableIdList, referencedRelationId))
+			{
+				continue;
+			}
+
+			List **dependentRelations = hash_search(graph, &referencedRelationId,
+													HASH_ENTER, &found);
+			if (!found)
+			{
+				*dependentRelations = NIL;
+			}
+			*dependentRelations = lappend_oid(*dependentRelations, relationId);
+
+			int *degree = hash_search(inDegree, &relationId, HASH_ENTER, &found);
+			(*degree)++;
+		}
+	}
+}
+
+
 static bool
 NodeHasAllReferenceTableReplicas(WorkerNode *workerNode)
 {

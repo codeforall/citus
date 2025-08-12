@@ -86,6 +86,8 @@ my $conninfo = "";
 my $publicWorker1Host = "localhost";
 my $publicWorker2Host = "localhost";
 my $workerCount = 2;
+my $backupnodetest = 0;
+my $clonePort = 0;
 
 my $serversAreShutdown = "TRUE";
 my $usingWindows = 0;
@@ -100,6 +102,7 @@ GetOptions(
     'isolationtester' => \$isolationtester,
     'vanillatest' => \$vanillatest,
     'follower-cluster' => \$followercluster,
+    'backup-node-test' => \$backupnodetest,
     'bindir=s' => \$bindir,
     'libdir=s' => \$libdir,
     'pgxsdir=s' => \$pgxsdir,
@@ -690,6 +693,13 @@ for my $workeroff (0 .. $#followerWorkerPorts)
 	print $fh "--variable=follower_worker_".($workeroff+1)."_port=$port ";
 }
 
+if ($backupnodetest)
+{
+	$clonePort = $workerPorts[0] + 100;
+	print $fh "--variable=clone_host=localhost ";
+	print $fh "--variable=clone_port=$clonePort ";
+}
+
 if ($usingWindows)
 {
 	print $fh "--variable=dev_null=\"/nul\" ";
@@ -1170,6 +1180,30 @@ if ($useMitmproxy) {
 }
 
 # Finally run the tests
+if ($backupnodetest)
+{
+	my $source_port = $workerPorts[0];
+	my $source_datadir = catfile($TMP_CHECKDIR, "worker.$source_port", 'data');
+	my $clone_datadir = catfile($TMP_CHECKDIR, 'worker_clone', 'data');
+
+	# remove clone directory if it exists
+	if (-e catfile($TMP_CHECKDIR, 'worker_clone'))
+	{
+		remove_tree(catfile($TMP_CHECKDIR, 'worker_clone')) or die "Could not remove worker_clone directory";
+	}
+
+	# create a directory for the clone
+	make_path($clone_datadir) or die "Could not create worker_clone directory";
+
+	# take the backup
+	system(catfile($bindir, "pg_basebackup"), ("-D", $clone_datadir, "-h", "localhost", "-p", $source_port, "--xlog-method=stream", "-R")) == 0
+		or die "pg_basebackup failed: $?";
+
+	# start the new node on the clone_port
+	system(catfile($bindir, "pg_ctl"), ("-D", $clone_datadir, "-o", "-p $clonePort", "start")) == 0
+		or die "pg_ctl start failed: $?";
+}
+
 if ($vanillatest)
 {
     RunVanillaTests();

@@ -1,0 +1,105 @@
+--
+-- Test for adding a worker node from a backup
+--
+
+-- setup cluster
+SELECT 1 FROM master_add_node('localhost', :worker_1_port);
+ master_add_node 
+-----------------
+               1
+(1 row)
+
+SELECT 1 FROM master_add_node('localhost', :worker_2_port);
+ master_add_node 
+-----------------
+               1
+(1 row)
+
+
+-- create a distributed table and load data
+CREATE TABLE backup_test(id int, value text);
+CREATE TABLE
+SELECT create_distributed_table('backup_test', 'id', 'hash');
+ create_distributed_table 
+--------------------------
+ 
+(1 row)
+
+INSERT INTO backup_test SELECT g, 'test' || g FROM generate_series(1, 10) g;
+INSERT 0 10
+
+-- verify initial shard placement
+SELECT nodename, nodeport, count(shardid) FROM pg_dist_shard_placement GROUP BY nodename, nodeport ORDER BY nodename, nodeport;
+ nodename  | nodeport | count 
+-----------+----------+-------
+ localhost |    57637 |     2
+ localhost |    57638 |     2
+(2 rows)
+
+-- wait for the new node to be ready
+-- register the new node as a clone
+-- the function returns the new node id
+SELECT citus_add_clone_node(:'clone_host', :worker_1_port, :'clone_host', :clone_port) AS clone_node_id \gset;
+ clone_node_id 
+---------------
+             3
+(1 row)
+
+-- promote the clone and rebalance the shards
+SELECT citus_promote_clone_and_rebalance(:clone_node_id, 'test_campaign');
+ citus_promote_clone_and_rebalance 
+-------------------------------------
+ 
+(1 row)
+
+
+-- wait for rebalance to finish
+-- verify that the new node is active
+SELECT * FROM pg_dist_node WHERE nodeid = :clone_node_id;
+ nodeid | groupid | nodename  | nodeport | noderack | hasmetadata | isactive |   noderole    | nodecluster | metadatasynced | shouldhaveshards | nodeisclone | nodeprimarynodeid 
+--------+---------+-----------+----------+----------+-------------+----------+---------------+-------------+----------------+------------------+-------------+-------------------
+      3 |       3 | localhost |     6837 | default  | f           | t        | primary       | default     | f              | t                | t           |                 1
+(1 row)
+
+-- verify the new shard placement
+SELECT nodename, nodeport, count(shardid) FROM pg_dist_shard_placement GROUP BY nodename, nodeport ORDER BY nodename, nodeport;
+ nodename  | nodeport | count 
+-----------+----------+-------
+ localhost |    57637 |     1
+ localhost |    57638 |     2
+ localhost |     6837 |     1
+(3 rows)
+
+
+-- verify data
+SELECT count(*) FROM backup_test;
+ count 
+-------
+    10
+(1 row)
+
+SELECT id, value FROM backup_test ORDER BY id;
+ id | value  
+----+--------
+  1 | test1
+  2 | test2
+  3 | test3
+  4 | test4
+  5 | test5
+  6 | test6
+  7 | test7
+  8 | test8
+  9 | test9
+ 10 | test10
+(10 rows)
+
+-- cleanup
+DROP TABLE backup_test;
+DROP TABLE
+-- stop the clone node
+-- remove the clone node from the cluster
+SELECT master_remove_node(:'clone_host', :clone_port);
+ master_remove_node 
+--------------------
+                  1
+(1 row)

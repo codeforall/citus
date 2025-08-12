@@ -152,7 +152,7 @@ check-empty: all
 	-- $(MULTI_REGRESS_OPTS) $(EXTRA_TESTS)
 
 check-multi: all
-	$(pg_regress_multi_check) --load-extension=citus \
+	$(pg_regress_multi_check) --load-extension=citus --backup-node-test \
 	-- $(MULTI_REGRESS_OPTS) --schedule=$(citus_abs_srcdir)/multi_schedule $(EXTRA_TESTS)
 
 check-enterprise: all

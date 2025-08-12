@@ -139,3 +139,4 @@ test: check_mx
 test: generated_identity
 test: drop_database
 test: check_cluster_state
+test: multi_add_node_from_backup

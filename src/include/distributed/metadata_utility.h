@@ -30,6 +30,17 @@
 #include "distributed/relay_utility.h"
 #include "distributed/worker_manager.h"
 
+/*
+ * JobConfigOption is a struct that represents a single configuration
+ * option for a background job.
+ */
+typedef struct JobConfigOption
+{
+	char *name;
+	char *value;
+	bool is_local;
+} JobConfigOption;
+
 
 /* total number of hash tokens (2^32) */
 #define HASH_TOKEN_COUNT INT64CONST(4294967296)
@@ -448,8 +459,9 @@ extern BackgroundTask * ScheduleBackgroundTask(int64 jobId, Oid owner, char *com
 											   int dependingTaskCount,
 											   int64 dependingTaskIds[],
 											   int nodesInvolvedCount,
-												int32 nodesInvolved[],
-												ArrayType *jobConfig);
+											   int32 nodesInvolved[],
+											   JobConfigOption *jobConfigOptions,
+											   int jobConfigOptionCount);
 extern BackgroundTask * GetRunnableBackgroundTask(void);
 extern void ResetRunningBackgroundTasks(void);
 extern BackgroundJob * GetBackgroundJobByJobId(int64 jobId);

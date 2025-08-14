@@ -67,10 +67,8 @@
 #include "distributed/pg_dist_background_task.h"
 #include "distributed/pg_dist_backrgound_task_depend.h"
 #include "distributed/pg_dist_colocation.h"
-#include "utils/jsonb.h"
-#include "distributed/jsonb.h"
-#include "distributed/pg_dist_partition.h"
 #include "distributed/pg_dist_placement.h"
+#include "utils/typcache.h"
 #include "distributed/pg_dist_shard.h"
 #include "distributed/reference_table_utils.h"
 #include "distributed/relay_utility.h"
@@ -3075,7 +3073,8 @@ CreateBackgroundJob(const char *jobType, const char *description)
 BackgroundTask *
 ScheduleBackgroundTask(int64 jobId, Oid owner, char *command, int dependingTaskCount,
 					   int64 dependingTaskIds[], int nodesInvolvedCount, int32
-					   nodesInvolved[], ArrayType *jobConfig)
+					   nodesInvolved[], JobConfigOption *jobConfigOptions,
+					   int jobConfigOptionCount)
 {
 	BackgroundTask *task = NULL;
 
@@ -3154,10 +3153,44 @@ ScheduleBackgroundTask(int64 jobId, Oid owner, char *command, int dependingTaskC
 		nulls[Anum_pg_dist_background_task_nodes_involved - 1] = (nodesInvolvedCount ==
 																  0);
 
-		if (jobConfig != NULL)
+		if (jobConfigOptionCount > 0)
 		{
+			Datum *jobConfigDatums = palloc(sizeof(Datum) * jobConfigOptionCount);
+			Oid jobConfigOptionOid = GetSysCacheOid2(TYPENAMENSP, CStringGetDatum("job_config_option"), ObjectIdGetDatum(PG_CATALOG_NAMESPACE));
+			TupleDesc tupleDesc = TypeGetTupleDesc(jobConfigOptionOid, NULL);
+
+			for (int i = 0; i < jobConfigOptionCount; i++)
+			{
+				Datum values[3];
+				bool nulls[3];
+
+				values[0] = CStringGetTextDatum(jobConfigOptions[i].name);
+				nulls[0] = false;
+
+				values[1] = CStringGetTextDatum(jobConfigOptions[i].value);
+				nulls[1] = false;
+
+				values[2] = BoolGetDatum(jobConfigOptions[i].is_local);
+				nulls[2] = false;
+
+				HeapTuple tuple = heap_form_tuple(tupleDesc, values, nulls);
+				jobConfigDatums[i] = HeapTupleGetDatum(tuple);
+			}
+
+			int16 elmlen;
+			bool elmbyval;
+			char elmalign;
+			get_typlenbyvalalign(jobConfigOptionOid, &elmlen, &elmbyval, &elmalign);
+
+			ArrayType *jobConfigArray = construct_array(jobConfigDatums,
+														jobConfigOptionCount,
+														jobConfigOptionOid,
+														elmlen,
+														elmbyval,
+														elmalign);
+
 			values[Anum_pg_dist_background_task_job_config - 1] =
-				PointerGetDatum(jobConfig);
+				PointerGetDatum(jobConfigArray);
 			nulls[Anum_pg_dist_background_task_job_config - 1] = false;
 		}
 

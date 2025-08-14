@@ -51,10 +51,10 @@
 #include "utils/memutils.h"
 #include "utils/portal.h"
 #include "utils/ps_status.h"
-#include "utils/array.h"
 #include "utils/resowner.h"
 #include "utils/snapmgr.h"
 #include "utils/timeout.h"
+#include "catalog/pg_type.h"
 
 #include "distributed/background_jobs.h"
 #include "distributed/citus_safe_lib.h"
@@ -75,15 +75,13 @@
 #define CITUS_BACKGROUND_TASK_KEY_QUEUE 3
 #define CITUS_BACKGROUND_TASK_KEY_TASK_ID 4
 #define CITUS_BACKGROUND_TASK_KEY_JOB_ID 5
-#define CITUS_BACKGROUND_TASK_KEY_JOB_CONFIG 6
-#define CITUS_BACKGROUND_TASK_NKEYS 7
+#define CITUS_BACKGROUND_TASK_NKEYS 6
 
 static BackgroundWorkerHandle * StartCitusBackgroundTaskExecutor(char *database,
 																 char *user,
 																 char *command,
 																 int64 taskId,
 																 int64 jobId,
-																 char *jobConfig,
 																 dsm_segment **pSegment);
 static void ExecuteSqlString(const char *sql);
 static shm_mq_result ConsumeTaskWorkerOutput(shm_mq_handle *responseq, StringInfo message,
@@ -548,6 +546,49 @@ NewExecutorExceedsPgMaxWorkers(BackgroundWorkerHandle *handle,
  * AssignRunnableTaskToNewExecutor tries to assign given runnable task to a new task executor.
  * It reports the assignment status as return value.
  */
+static BackgroundWorkerHandle *
+StartCitusBackgroundTaskExecutor(char *database, char *user, char *command,
+								 int64 taskId, int64 jobId, char *jobConfig,
+								 dsm_segment **pSegment)
+{
+	dsm_segment *seg = StoreArgumentsInDSM(database, user, command, taskId, jobId,
+										   jobConfig);
+
+	/* Configure a worker. */
+	BackgroundWorker worker = { 0 };
+	memset(&worker, 0, sizeof(worker));
+	SafeSnprintf(worker.bgw_name, BGW_MAXLEN,
+				 "Citus Background Task Queue Executor: %s/%s for (%ld/%ld)",
+				 database, user, jobId, taskId);
+	worker.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
+	worker.bgw_start_time = BgWorkerStart_ConsistentState;
+
+	/* don't restart, we manage restarts from maintenance daemon */
+	worker.bgw_restart_time = BGW_NEVER_RESTART;
+	strcpy_s(worker.bgw_library_name, sizeof(worker.bgw_library_name), "citus");
+	strcpy_s(worker.bgw_function_name, sizeof(worker.bgw_library_name),
+			 "CitusBackgroundTaskExecutor");
+	worker.bgw_main_arg = UInt32GetDatum(dsm_segment_handle(seg));
+	worker.bgw_notify_pid = MyProcPid;
+
+	BackgroundWorkerHandle *handle = NULL;
+	if (!RegisterDynamicBackgroundWorker(&worker, &handle))
+	{
+		dsm_detach(seg);
+		return NULL;
+	}
+
+	pid_t pid = { 0 };
+	WaitForBackgroundWorkerStartup(handle, &pid);
+
+	if (pSegment)
+	{
+		*pSegment = seg;
+	}
+
+	return handle;
+}
+
 static bool
 AssignRunnableTaskToNewExecutor(BackgroundTask *runnableTask,
 								QueueMonitorExecutionContext *queueMonitorExecutionContext)
@@ -566,19 +607,9 @@ AssignRunnableTaskToNewExecutor(BackgroundTask *runnableTask,
 	/* try to create new executor and make it alive during queue monitor lifetime */
 	MemoryContext oldContext = MemoryContextSwitchTo(queueMonitorExecutionContext->ctx);
 	dsm_segment *seg = NULL;
-	char *jobConfigString = NULL;
-	if (runnableTask->jobConfig != NULL)
-	{
-		Oid typeOutput = InvalidOid;
-		bool typeIsVarlena = false;
-		getTypeOutputInfo(runnableTask->jobConfig->type, &typeOutput, &typeIsVarlena);
-		jobConfigString = OidOutputFunctionCall(typeOutput, runnableTask->jobConfig->value);
-	}
-
 	BackgroundWorkerHandle *handle =
 		StartCitusBackgroundTaskExecutor(databaseName, userName, runnableTask->command,
-										 runnableTask->taskid, runnableTask->jobid,
-										 jobConfigString, &seg);
+										 runnableTask->taskid, runnableTask->jobid, &seg);
 	MemoryContextSwitchTo(oldContext);
 
 	if (NewExecutorExceedsPgMaxWorkers(handle, queueMonitorExecutionContext))
@@ -1682,11 +1713,9 @@ StoreArgumentsInDSM(char *database, char *username, char *command,
  */
 static BackgroundWorkerHandle *
 StartCitusBackgroundTaskExecutor(char *database, char *user, char *command,
-								 int64 taskId, int64 jobId, char *jobConfig,
-								 dsm_segment **pSegment)
+								 int64 taskId, int64 jobId, dsm_segment **pSegment)
 {
-	dsm_segment *seg = StoreArgumentsInDSM(database, user, command, taskId, jobId,
-										   jobConfig);
+	dsm_segment *seg = StoreArgumentsInDSM(database, user, command, taskId, jobId);
 
 	/* Configure a worker. */
 	BackgroundWorker worker = { 0 };
@@ -1788,7 +1817,6 @@ CitusBackgroundTaskExecutor(Datum main_arg)
 	int64 *taskId = shm_toc_lookup(toc, CITUS_BACKGROUND_TASK_KEY_TASK_ID, false);
 	int64 *jobId = shm_toc_lookup(toc, CITUS_BACKGROUND_TASK_KEY_JOB_ID, false);
 	char *jobConfig = shm_toc_lookup(toc, CITUS_BACKGROUND_TASK_KEY_JOB_CONFIG, true);
-	char *jobConfig = shm_toc_lookup(toc, CITUS_BACKGROUND_TASK_KEY_JOB_CONFIG, true);
 	shm_mq *mq = shm_toc_lookup(toc, CITUS_BACKGROUND_TASK_KEY_QUEUE, false);
 
 	shm_mq_set_sender(mq, MyProc);
@@ -1832,7 +1860,8 @@ CitusBackgroundTaskExecutor(Datum main_arg)
 	{
 		Oid typeInput = InvalidOid;
 		Oid typIOParam = InvalidOid;
-		getTypeInputInfo(F_RECORD, &typeInput, &typIOParam);
+		Oid jobConfigOptionOid = GetSysCacheOid2(TYPENAMENSP, CStringGetDatum("job_config_option"), ObjectIdGetDatum(PG_CATALOG_NAMESPACE));
+		getTypeInputInfo(jobConfigOptionOid, &typeInput, &typIOParam);
 		Datum jobConfigDatum = OidInputFunctionCall(typeInput, jobConfig);
 
 		ArrayType *jobConfigArray = DatumGetArrayTypeP(jobConfigDatum);

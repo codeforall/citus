@@ -49,9 +49,9 @@
 #include "utils/fmgrprotos.h"
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
-#include "utils/jsonb.h"
 #include "utils/portal.h"
 #include "utils/ps_status.h"
+#include "utils/array.h"
 #include "utils/resowner.h"
 #include "utils/snapmgr.h"
 #include "utils/timeout.h"
@@ -83,6 +83,7 @@ static BackgroundWorkerHandle * StartCitusBackgroundTaskExecutor(char *database,
 																 char *command,
 																 int64 taskId,
 																 int64 jobId,
+																 char *jobConfig,
 																 dsm_segment **pSegment);
 static void ExecuteSqlString(const char *sql);
 static shm_mq_result ConsumeTaskWorkerOutput(shm_mq_handle *responseq, StringInfo message,
@@ -568,8 +569,10 @@ AssignRunnableTaskToNewExecutor(BackgroundTask *runnableTask,
 	char *jobConfigString = NULL;
 	if (runnableTask->jobConfig != NULL)
 	{
-		jobConfigString = JsonbToCString(NULL, &runnableTask->jobConfig->root,
-										 VARSIZE(runnableTask->jobConfig));
+		Oid typeOutput = InvalidOid;
+		bool typeIsVarlena = false;
+		getTypeOutputInfo(runnableTask->jobConfig->type, &typeOutput, &typeIsVarlena);
+		jobConfigString = OidOutputFunctionCall(typeOutput, runnableTask->jobConfig->value);
 	}
 
 	BackgroundWorkerHandle *handle =
@@ -1785,6 +1788,7 @@ CitusBackgroundTaskExecutor(Datum main_arg)
 	int64 *taskId = shm_toc_lookup(toc, CITUS_BACKGROUND_TASK_KEY_TASK_ID, false);
 	int64 *jobId = shm_toc_lookup(toc, CITUS_BACKGROUND_TASK_KEY_JOB_ID, false);
 	char *jobConfig = shm_toc_lookup(toc, CITUS_BACKGROUND_TASK_KEY_JOB_CONFIG, true);
+	char *jobConfig = shm_toc_lookup(toc, CITUS_BACKGROUND_TASK_KEY_JOB_CONFIG, true);
 	shm_mq *mq = shm_toc_lookup(toc, CITUS_BACKGROUND_TASK_KEY_QUEUE, false);
 
 	shm_mq_set_sender(mq, MyProc);
@@ -1826,21 +1830,41 @@ CitusBackgroundTaskExecutor(Datum main_arg)
 
 	if (jobConfig != NULL)
 	{
-		Jsonb *config = DatumGetJsonb(DirectFunctionCall1(jsonb_in, CStringGetDatum(jobConfig)));
-		JsonbIterator *iterator = JsonbIteratorInit(&config->root);
-		JsonbValue value;
-		JsonbIteratorToken token;
+		Oid typeInput = InvalidOid;
+		Oid typIOParam = InvalidOid;
+		getTypeInputInfo(F_RECORD, &typeInput, &typIOParam);
+		Datum jobConfigDatum = OidInputFunctionCall(typeInput, jobConfig);
 
-		while ((token = JsonbIteratorNext(&iterator, &value, false)) != WJB_DONE)
+		ArrayType *jobConfigArray = DatumGetArrayTypeP(jobConfigDatum);
+		int num_elems;
+		Datum *elems;
+		Oid elem_type = ARR_ELEMTYPE(jobConfigArray);
+		int16 elem_len;
+		bool elem_byval;
+		char elem_align;
+
+		get_typlenbyvalalign(elem_type, &elem_len, &elem_byval, &elem_align);
+		deconstruct_array(jobConfigArray, elem_type, elem_len, elem_byval, elem_align, &elems, NULL, &num_elems);
+
+		for (int i = 0; i < num_elems; i++)
 		{
-			if (token == WJB_ELEM)
-			{
-				JsonbValue *name = getIJsonbValueFromContainer(&value.val.array.children[0]);
-				JsonbValue *val = getIJsonbValueFromContainer(&value.val.array.children[1]);
-				JsonbValue *is_local = getIJsonbValueFromContainer(&value.val.array.children[2]);
+			HeapTupleHeader tupleHeader = DatumGetHeapTupleHeader(elems[i]);
+			Oid tuple_typeid = HeapTupleHeaderGetTypeId(tupleHeader);
+			int32 tuple_typmod = HeapTupleHeaderGetTypMod(tupleHeader);
+			TupleDesc tupleDesc = lookup_rowtype_tupdesc(tuple_typeid, tuple_typmod);
+			HeapTupleData tuple;
+			tuple.t_len = HeapTupleHeaderGetDatumLength(tupleHeader);
+			ItemPointerSetInvalid(&(tuple.t_self));
+			tuple.t_tableOid = InvalidOid;
+			tuple.t_data = tupleHeader;
 
-				SetPGVariable(NameStr(name->val.string), list_make1(makeString(NameStr(val->val.string))), is_local->val.boolean);
-			}
+			bool isnull;
+			Datum name = heap_getattr(&tuple, 1, tupleDesc, &isnull);
+			Datum value = heap_getattr(&tuple, 2, tupleDesc, &isnull);
+			Datum is_local = heap_getattr(&tuple, 3, tupleDesc, &isnull);
+
+			SetPGVariable(TextDatumGetCString(name), list_make1(makeString(TextDatumGetCString(value))), DatumGetBool(is_local));
+			ReleaseTupleDesc(tupleDesc);
 		}
 	}
 

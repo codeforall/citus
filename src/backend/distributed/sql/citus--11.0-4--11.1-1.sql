@@ -126,6 +126,13 @@ GRANT SELECT ON pg_catalog.pg_dist_cleanup_recordid_seq TO public;
 CREATE TYPE citus.citus_job_status AS ENUM ('scheduled', 'running', 'finished', 'cancelling', 'cancelled', 'failing', 'failed');
 ALTER TYPE citus.citus_job_status SET SCHEMA pg_catalog;
 
+CREATE TYPE citus.job_config_option AS (
+    name text,
+    value text,
+    is_local boolean
+);
+ALTER TYPE citus.job_config_option SET SCHEMA pg_catalog;
+
 CREATE TABLE citus.pg_dist_background_job (
     job_id bigserial NOT NULL,
     state pg_catalog.citus_job_status DEFAULT 'scheduled' NOT NULL,
@@ -153,7 +160,7 @@ CREATE TABLE citus.pg_dist_background_task(
     retry_count integer,
     not_before timestamptz, -- can be null to indicate no delay for start of the task, will be set on failure to delay retries
     message text NOT NULL DEFAULT '',
-    job_config jsonb DEFAULT NULL,
+    job_config pg_catalog.job_config_option[],
 
     CONSTRAINT pg_dist_background_task_pkey PRIMARY KEY (task_id),
     CONSTRAINT pg_dist_background_task_job_id_task_id UNIQUE (job_id, task_id) -- required for FK's to enforce tasks only reference other tasks within the same job

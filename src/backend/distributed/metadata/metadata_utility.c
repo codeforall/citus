@@ -3075,8 +3075,7 @@ CreateBackgroundJob(const char *jobType, const char *description)
 BackgroundTask *
 ScheduleBackgroundTask(int64 jobId, Oid owner, char *command, int dependingTaskCount,
 					   int64 dependingTaskIds[], int nodesInvolvedCount, int32
-					   nodesInvolved[], JobConfigOption *jobConfigOptions,
-					   int jobConfigOptionCount)
+					   nodesInvolved[], ArrayType *jobConfig)
 {
 	BackgroundTask *task = NULL;
 
@@ -3155,12 +3154,10 @@ ScheduleBackgroundTask(int64 jobId, Oid owner, char *command, int dependingTaskC
 		nulls[Anum_pg_dist_background_task_nodes_involved - 1] = (nodesInvolvedCount ==
 																  0);
 
-		if (jobConfigOptionCount > 0)
+		if (jobConfig != NULL)
 		{
-			Jsonb *jobConfig = JobConfigOptionArrayToJsonb(jobConfigOptions,
-														   jobConfigOptionCount);
 			values[Anum_pg_dist_background_task_job_config - 1] =
-				JsonbGetDatum(jobConfig);
+				PointerGetDatum(jobConfig);
 			nulls[Anum_pg_dist_background_task_job_config - 1] = false;
 		}
 
@@ -3484,7 +3481,7 @@ DeformBackgroundTaskHeapTuple(TupleDesc tupleDescriptor, HeapTuple taskTuple)
 
 	if (!nulls[Anum_pg_dist_background_task_job_config - 1])
 	{
-		task->jobConfig = DatumGetJsonb(values[Anum_pg_dist_background_task_job_config - 1]);
+		task->jobConfig = values[Anum_pg_dist_background_task_job_config - 1];
 	}
 
 	return task;
